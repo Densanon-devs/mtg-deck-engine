@@ -208,11 +208,11 @@ def _is_tutor(card: Card) -> bool:
     ot = card.oracle_text.lower()
     if card.is_land:
         return False
-    return (
-        "search your library" in ot
-        and "put" in ot
-        and "land" not in ot.split("search your library")[1][:30]
-    )
+    if "search your library" not in ot or "put" not in ot:
+        return False
+    # Exclude land-fetching ramp spells
+    after_search = ot.split("search your library", 1)[1]
+    return not re.search(r"for\s+a\s+(?:basic\s+)?land", after_search)
 
 
 def _is_cantrip(card: Card) -> bool:
@@ -379,13 +379,13 @@ def _is_sacrifice_outlet(card: Card) -> bool:
 
 def _is_aristocrat_payoff(card: Card) -> bool:
     ot = card.oracle_text.lower()
-    return ("whenever" in ot and "dies" in ot) and (
+    if not ("whenever" in ot and "dies" in ot):
+        return False
+    return (
         "each opponent loses" in ot
         or "you gain" in ot
         or "draw a card" in ot
-        or "deals.*damage" in re.search(r"deals.*damage", ot or "").string
-        if re.search(r"deals.*damage", ot)
-        else False
+        or bool(re.search(r"deals.*damage", ot))
     )
 
 

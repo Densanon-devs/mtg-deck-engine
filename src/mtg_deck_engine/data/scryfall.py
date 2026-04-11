@@ -32,23 +32,30 @@ async def fetch_bulk_data_url() -> str:
 
 
 async def download_bulk_file(url: str, dest: Path) -> Path:
-    """Stream-download the bulk JSON file."""
+    """Stream-download the bulk JSON file with atomic write."""
     dest.parent.mkdir(parents=True, exist_ok=True)
-    async with httpx.AsyncClient(follow_redirects=True) as client:
-        async with client.stream("GET", url) as resp:
-            resp.raise_for_status()
-            total = int(resp.headers.get("content-length", 0))
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                BarColumn(),
-                TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-            ) as progress:
-                task = progress.add_task("Downloading Scryfall data...", total=total)
-                with open(dest, "wb") as f:
-                    async for chunk in resp.aiter_bytes(chunk_size=65536):
-                        f.write(chunk)
-                        progress.update(task, advance=len(chunk))
+    tmp = dest.with_suffix(".tmp")
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=300) as client:
+            async with client.stream("GET", url) as resp:
+                resp.raise_for_status()
+                total = int(resp.headers.get("content-length", 0))
+                with Progress(
+                    SpinnerColumn(),
+                    TextColumn("[progress.description]{task.description}"),
+                    BarColumn(),
+                    TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+                ) as progress:
+                    task = progress.add_task("Downloading Scryfall data...", total=total or None)
+                    with open(tmp, "wb") as f:
+                        async for chunk in resp.aiter_bytes(chunk_size=65536):
+                            f.write(chunk)
+                            progress.update(task, advance=len(chunk))
+        # Atomic rename on success
+        tmp.replace(dest)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
     return dest
 
 
@@ -174,25 +181,33 @@ async def ingest(db: CardDatabase | None = None, force: bool = False):
 
     console.print("[bold cyan]Starting Scryfall data ingestion...[/bold cyan]")
 
-    # Get download URL
-    url = await fetch_bulk_data_url()
-    console.print(f"[dim]Bulk data URL: {url}[/dim]")
-
-    # Download
     cache_dir = db.db_path.parent / "bulk"
     cache_dir.mkdir(parents=True, exist_ok=True)
     dest = cache_dir / "oracle_cards.json"
-    await download_bulk_file(url, dest)
 
-    # Parse
-    cards = load_bulk_file(dest)
+    try:
+        # Get download URL
+        url = await fetch_bulk_data_url()
+        console.print(f"[dim]Bulk data URL: {url}[/dim]")
 
-    # Store
-    console.print("[cyan]Storing cards in database...[/cyan]")
-    db.upsert_cards(cards)
-    db.set_metadata("last_ingest", str(len(cards)))
-    console.print(f"[bold green]Done! {len(cards)} cards stored.[/bold green]")
+        # Download
+        await download_bulk_file(url, dest)
 
-    # Clean up bulk file to save space
-    dest.unlink(missing_ok=True)
-    console.print("[dim]Cleaned up bulk download file.[/dim]")
+        # Parse
+        cards = load_bulk_file(dest)
+
+        # Store
+        console.print("[cyan]Storing cards in database...[/cyan]")
+        db.upsert_cards(cards)
+        db.set_metadata("last_ingest", str(len(cards)))
+        console.print(f"[bold green]Done! {len(cards)} cards stored.[/bold green]")
+    except httpx.HTTPError as e:
+        console.print(f"[bold red]Network error during ingestion: {e}[/bold red]")
+        console.print("[yellow]Check your internet connection or try again later.[/yellow]")
+        raise SystemExit(1)
+    except (json.JSONDecodeError, KeyError) as e:
+        console.print(f"[bold red]Failed to parse card data: {e}[/bold red]")
+        raise SystemExit(1)
+    finally:
+        # Always clean up bulk file
+        dest.unlink(missing_ok=True)

@@ -19,5 +19,4 @@ def scryfall_image_url(scryfall_id: str, face: str = "front", size: str = "norma
         face: 'front' or 'back' for DFCs.
         size: 'small', 'normal', 'large', 'png', 'art_crop', 'border_crop'.
     """
-    id_prefix = scryfall_id[:2]
-    return f"{SCRYFALL_IMAGE_BASE}/{size}/{face}/{id_prefix}/{scryfall_id}.jpg"
+    return f"{SCRYFALL_IMAGE_BASE}/{size}/{face}/{scryfall_id[0]}/{scryfall_id[1]}/{scryfall_id}.jpg"

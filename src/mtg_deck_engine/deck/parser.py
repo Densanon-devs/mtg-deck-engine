@@ -10,7 +10,7 @@ from mtg_deck_engine.models import DeckEntry, Zone
 # Regex patterns for decklist parsing
 # Matches: "1 Lightning Bolt", "1x Lightning Bolt", "Lightning Bolt"
 _QTY_NAME = re.compile(r"^\s*(\d+)\s*[xX]?\s+(.+?)\s*$")
-_NAME_ONLY = re.compile(r"^\s*([A-Z].+?)\s*$")
+_NAME_ONLY = re.compile(r"^\s*([A-Za-z].+?)\s*$")
 
 # Section headers
 _SECTION_PATTERNS = {

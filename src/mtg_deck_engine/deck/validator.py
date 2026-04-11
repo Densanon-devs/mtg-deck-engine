@@ -171,10 +171,8 @@ def _check_unresolved(deck: Deck, issues: list[ValidationIssue]):
 
 def _check_deck_size(deck: Deck, rules: dict, issues: list[ValidationIssue]):
     """Check minimum/maximum deck size."""
-    # For commander, total includes commander zone
+    # total_cards already includes commander zone, so don't double-count
     total = deck.total_cards
-    if rules.get("requires_commander"):
-        total += sum(e.quantity for e in deck.commanders)
 
     min_size = rules.get("min_deck")
     max_size = rules.get("max_deck")

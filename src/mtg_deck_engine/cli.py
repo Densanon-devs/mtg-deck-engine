@@ -10,8 +10,6 @@ from pathlib import Path
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
-from rich.text import Text
-
 from mtg_deck_engine.analysis.static import analyze_deck
 from mtg_deck_engine.data.database import CardDatabase
 from mtg_deck_engine.data.scryfall import ingest
