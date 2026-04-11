@@ -49,6 +49,15 @@ mtg-engine analyze my_deck.txt --format commander --export report.html
 # Run gauntlet with a specific meta suite
 mtg-engine gauntlet my_deck.txt --suite cedh
 
+# Quick probability calculator (no deck file needed)
+mtg-engine calc --deck 99 --copies 4 --turns 7
+
+# Compare two different decks side by side
+mtg-engine diff deck_a.txt deck_b.txt --format commander
+
+# Interactive mulligan practice
+mtg-engine practice my_deck.txt --format commander --rounds 10
+
 # Search cards
 mtg-engine search "Lightning Bolt"
 

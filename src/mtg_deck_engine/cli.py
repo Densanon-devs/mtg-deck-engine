@@ -11,6 +11,10 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+# Use safe console that handles piped output and non-UTF-8 terminals
+import io as _io, sys as _sys
+_force_terminal = _sys.stdout.isatty() if hasattr(_sys.stdout, "isatty") else False
+
 # Core imports needed by most commands
 from mtg_deck_engine.data.database import CardDatabase
 from mtg_deck_engine.legal import ATTRIBUTION, DISCLAIMER
@@ -20,7 +24,7 @@ from mtg_deck_engine.models import Format
 # simple commands like `info` and `search`. Each cmd_* function imports
 # only what it needs.
 
-console = Console()
+console = Console(force_terminal=_force_terminal)
 
 COLOR_SYMBOLS = {"W": "☀", "U": "💧", "B": "💀", "R": "🔥", "G": "🌿"}
 COLOR_NAMES = {"W": "White", "U": "Blue", "B": "Black", "R": "Red", "G": "Green"}
@@ -129,6 +133,27 @@ def main():
     search_parser.add_argument("query", type=str, help="Search query")
     search_parser.add_argument("--db", type=str, help="Custom database path")
 
+    # calc command
+    calc_parser = subparsers.add_parser("calc", help="Quick hypergeometric probability calculator")
+    calc_parser.add_argument("--deck", type=int, required=True, help="Deck size")
+    calc_parser.add_argument("--copies", type=int, required=True, help="Copies in deck")
+    calc_parser.add_argument("--turns", type=int, default=7, help="Calculate through turn N (default: 7)")
+    calc_parser.add_argument("--draw", action="store_true", help="On the draw (default: on the play)")
+
+    # diff command
+    diff_parser = subparsers.add_parser("diff", help="Compare two different decks side by side")
+    diff_parser.add_argument("file_a", type=str, help="First decklist file")
+    diff_parser.add_argument("file_b", type=str, help="Second decklist file")
+    diff_parser.add_argument("--format", type=str, default=None, choices=[f.value for f in Format])
+    diff_parser.add_argument("--db", type=str, help="Custom database path")
+
+    # practice command
+    practice_parser = subparsers.add_parser("practice", help="Interactive mulligan practice")
+    practice_parser.add_argument("file", type=str, help="Path to decklist file")
+    practice_parser.add_argument("--format", type=str, default=None, choices=[f.value for f in Format])
+    practice_parser.add_argument("--db", type=str, help="Custom database path")
+    practice_parser.add_argument("--rounds", type=int, default=10, help="Number of practice rounds")
+
     # info command
     info_parser = subparsers.add_parser("info", help="Show database info")
     info_parser.add_argument("--db", type=str, help="Custom database path")
@@ -155,6 +180,12 @@ def main():
         cmd_compare(args)
     elif args.command == "history":
         cmd_history(args)
+    elif args.command == "calc":
+        cmd_calc(args)
+    elif args.command == "diff":
+        cmd_diff(args)
+    elif args.command == "practice":
+        cmd_practice(args)
     elif args.command == "search":
         cmd_search(args)
     elif args.command == "info":
@@ -235,13 +266,63 @@ def cmd_analyze(args):
         # Display
         _render_dashboard(result, deck)
 
-        # Archetype and advanced
+        # Power level
+        from mtg_deck_engine.analysis.power_level import estimate_power_level
+        power = estimate_power_level(deck)
+
+        # Castability
+        from mtg_deck_engine.analysis.castability import analyze_castability
+        castability = analyze_castability(deck, result.color_sources)
+
+        # Staples
+        from mtg_deck_engine.analysis.staples import check_staples
+        staples = check_staples(deck)
+
+        # Archetype, power, advanced summary
+        summary_parts = []
         if archetype.value != "unknown":
-            console.print(f"  [bold]Detected Archetype:[/bold] {archetype.value.replace('_', ' ').title()}")
+            summary_parts.append(f"[bold]Archetype:[/bold] {archetype.value.replace('_', ' ').title()}")
+        summary_parts.append(f"[bold]Power Level:[/bold] {power.overall}/10 ({power.tier})")
         if adv.mana_base_grade:
-            console.print(f"  [bold]Mana Base Grade:[/bold] {adv.mana_base_grade}")
+            summary_parts.append(f"[bold]Mana Base:[/bold] {adv.mana_base_grade}")
         if adv.synergies:
-            console.print(f"  [bold]Synergies Found:[/bold] {len(adv.synergies)}")
+            summary_parts.append(f"[bold]Synergies:[/bold] {len(adv.synergies)}")
+        if staples.missing:
+            essential = [s for s in staples.missing if s.priority == "essential"]
+            if essential:
+                summary_parts.append(f"[bold red]Missing Staples:[/bold red] {len(essential)} essential")
+
+        console.print("  " + "  |  ".join(summary_parts))
+
+        # Power breakdown
+        console.print(
+            f"  [dim]Speed {power.speed:.0f} | Interaction {power.interaction:.0f} | "
+            f"Combo {power.combo_potential:.0f} | Mana {power.mana_efficiency:.0f} | "
+            f"WinCons {power.win_condition_quality:.0f} | Quality {power.card_quality:.0f}[/dim]"
+        )
+
+        # Castability warnings
+        if castability.unreliable_cards:
+            console.print(f"\n  [yellow]Casting concerns ({len(castability.unreliable_cards)} cards):[/yellow]")
+            for cc in castability.unreliable_cards[:5]:
+                console.print(
+                    f"    [dim]{cc.name} ({cc.mana_cost}): "
+                    f"{cc.on_curve_probability * 100:.0f}% on curve[/dim]"
+                )
+
+        # Missing essential staples
+        if staples.missing:
+            essentials = [s for s in staples.missing if s.priority == "essential"]
+            recommended = [s for s in staples.missing if s.priority == "recommended"]
+            if essentials:
+                console.print(f"\n  [red]Missing essential staples:[/red]")
+                for s in essentials:
+                    console.print(f"    [dim]- {s.name}: {s.reason}[/dim]")
+            if recommended:
+                console.print(f"  [yellow]Consider adding:[/yellow]")
+                for s in recommended[:5]:
+                    console.print(f"    [dim]- {s.name}: {s.reason}[/dim]")
+
         console.print()
 
         # Probability layer (--deep)
@@ -640,6 +721,217 @@ def cmd_history(args):
 
     finally:
         store.close()
+
+
+def cmd_calc(args):
+    """Standalone hypergeometric calculator."""
+    from mtg_deck_engine.probability.hypergeometric import cards_seen_by_turn, prob_card_by_turn
+
+    N = args.deck
+    K = args.copies
+    on_play = not args.draw
+
+    console.print(Panel(
+        f"[bold]Deck Size:[/bold] {N}  |  [bold]Copies:[/bold] {K}  |  "
+        f"[bold]On the {'draw' if args.draw else 'play'}[/bold]",
+        title="[bold cyan]Hypergeometric Calculator[/bold cyan]",
+        border_style="cyan",
+    ))
+
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("Turn", justify="center", width=6)
+    table.add_column("Cards Seen", justify="right", width=10)
+    table.add_column("P(at least 1)", justify="right", width=13)
+    table.add_column("", min_width=20)
+
+    for turn in range(1, args.turns + 1):
+        seen = min(cards_seen_by_turn(turn, on_play), N)
+        p = prob_card_by_turn(K, N, turn, on_play)
+        pct = f"{p * 100:.1f}%"
+        bar_len = int(p * 20)
+        bar = "█" * bar_len
+        color = "green" if p >= 0.75 else "yellow" if p >= 0.5 else "dim"
+        table.add_row(str(turn), str(seen), f"[{color}]{pct}[/{color}]", f"[{color}]{bar}[/{color}]")
+
+    console.print(table)
+
+
+def cmd_diff(args):
+    """Compare two different decks."""
+    from mtg_deck_engine.analysis.deck_diff import compare_decks
+    from mtg_deck_engine.deck.parser import parse_auto
+    from mtg_deck_engine.deck.resolver import resolve_deck
+
+    db = _get_db(args)
+    try:
+        if db.card_count() == 0:
+            console.print("[red]No cards in database. Run 'mtg-engine ingest' first.[/red]")
+            sys.exit(1)
+
+        for f in (args.file_a, args.file_b):
+            if not Path(f).exists():
+                console.print(f"[red]File not found: {f}[/red]")
+                sys.exit(1)
+
+        fmt = Format(args.format) if args.format else None
+
+        text_a = Path(args.file_a).read_text(encoding="utf-8")
+        text_b = Path(args.file_b).read_text(encoding="utf-8")
+        deck_a = resolve_deck(parse_auto(text_a), db, name=Path(args.file_a).stem, format=fmt)
+        deck_b = resolve_deck(parse_auto(text_b), db, name=Path(args.file_b).stem, format=fmt)
+
+        comp = compare_decks(deck_a, deck_b)
+
+        console.print(Panel(
+            f"[bold]{comp.name_a}[/bold] vs [bold]{comp.name_b}[/bold]  |  "
+            f"{comp.overlap_percentage:.0f}% card overlap",
+            title="[bold cyan]Deck Comparison[/bold cyan]",
+            border_style="cyan",
+        ))
+
+        # Score comparison
+        if comp.score_deltas:
+            table = Table(title="Score Comparison", show_header=True, header_style="bold")
+            table.add_column("Category", width=18)
+            table.add_column(comp.name_a, justify="right", width=8)
+            table.add_column(comp.name_b, justify="right", width=8)
+            table.add_column("Delta", justify="right", width=8)
+
+            for key, delta in comp.score_deltas.items():
+                sa = comp.result_a.scores.get(key, 0) if comp.result_a else 0
+                sb = comp.result_b.scores.get(key, 0) if comp.result_b else 0
+                name = key.replace("_", " ").title()
+                color = "green" if delta > 3 else "red" if delta < -3 else "dim"
+                table.add_row(name, f"{sa:.0f}", f"{sb:.0f}", f"[{color}]{delta:+.0f}[/{color}]")
+            console.print(table)
+
+        # Role comparison
+        if comp.role_comparison:
+            table = Table(title="Role Distribution", show_header=True, header_style="bold")
+            table.add_column("Role", width=18)
+            table.add_column(comp.name_a, justify="right", width=8)
+            table.add_column(comp.name_b, justify="right", width=8)
+            for role, (ca, cb) in comp.role_comparison.items():
+                table.add_row(role.replace("_", " ").title(), str(ca), str(cb))
+            console.print(table)
+
+        # Advantages
+        if comp.a_advantages:
+            console.print(Panel(
+                "\n".join(f"  + {a}" for a in comp.a_advantages),
+                title=f"[green]{comp.name_a} Advantages[/green]", border_style="green",
+            ))
+        if comp.b_advantages:
+            console.print(Panel(
+                "\n".join(f"  + {a}" for a in comp.b_advantages),
+                title=f"[green]{comp.name_b} Advantages[/green]", border_style="green",
+            ))
+
+        console.print(f"\n[dim]{DISCLAIMER}[/dim]\n")
+    finally:
+        db.close()
+
+
+def cmd_practice(args):
+    """Interactive mulligan practice mode."""
+    import random
+    from mtg_deck_engine.deck.parser import parse_auto
+    from mtg_deck_engine.deck.resolver import resolve_deck
+    from mtg_deck_engine.probability.opening_hand import evaluate_hand
+
+    db = _get_db(args)
+    try:
+        if db.card_count() == 0:
+            console.print("[red]No cards in database. Run 'mtg-engine ingest' first.[/red]")
+            sys.exit(1)
+
+        file_path = Path(args.file)
+        if not file_path.exists():
+            console.print(f"[red]File not found: {file_path}[/red]")
+            sys.exit(1)
+
+        text = file_path.read_text(encoding="utf-8")
+        fmt = Format(args.format) if args.format else None
+        deck = resolve_deck(parse_auto(text), db, name=file_path.stem, format=fmt)
+
+        # Build pool
+        from mtg_deck_engine.models import Zone
+        pool = []
+        for entry in deck.entries:
+            if entry.zone in (Zone.MAYBEBOARD, Zone.SIDEBOARD):
+                continue
+            for _ in range(entry.quantity):
+                pool.append(entry)
+
+        if len(pool) < 7:
+            console.print("[red]Deck too small for practice.[/red]")
+            return
+
+        console.print(Panel(
+            f"[bold]{deck.name}[/bold] — Mulligan Practice ({args.rounds} rounds)\n"
+            f"For each hand, type [bold]k[/bold] to keep or [bold]m[/bold] to mulligan.",
+            title="[bold blue]Mulligan Practice[/bold blue]",
+            border_style="blue",
+        ))
+
+        correct = 0
+        total = 0
+
+        for round_num in range(1, args.rounds + 1):
+            shuffled = pool.copy()
+            random.shuffle(shuffled)
+            hand = shuffled[:7]
+
+            console.print(f"\n[bold]--- Round {round_num}/{args.rounds} ---[/bold]")
+            table = Table(show_header=False)
+            table.add_column("Card", width=30)
+            table.add_column("Type", width=20)
+            table.add_column("CMC", justify="right", width=4)
+
+            lands = 0
+            for entry in hand:
+                card = entry.card
+                if card:
+                    if card.is_land:
+                        lands += 1
+                    table.add_row(
+                        card.name,
+                        card.type_line[:20] if card.type_line else "",
+                        str(int(card.cmc)) if not card.is_land else "",
+                    )
+            console.print(table)
+            console.print(f"  [dim]({lands} lands, {7 - lands} spells)[/dim]")
+
+            # Engine evaluation
+            ev = evaluate_hand(hand, deck)
+            engine_keep = ev.keepable
+
+            # Get user input
+            try:
+                answer = input("  Keep (k) or Mulligan (m)? ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                console.print("\n[dim]Practice ended.[/dim]")
+                break
+
+            user_keep = answer.startswith("k")
+            total += 1
+
+            if user_keep == engine_keep:
+                correct += 1
+                console.print(f"  [green]Correct![/green] Engine score: {ev.score:.0f}/100 ({ev.archetype.value})")
+            else:
+                engine_decision = "KEEP" if engine_keep else "MULL"
+                console.print(
+                    f"  [red]Engine says {engine_decision}[/red] — "
+                    f"score: {ev.score:.0f}/100 ({ev.archetype.value})"
+                )
+
+        if total > 0:
+            pct = correct / total * 100
+            console.print(f"\n[bold]Results: {correct}/{total} ({pct:.0f}%) agreement with engine[/bold]")
+
+    finally:
+        db.close()
 
 
 def _run_and_render_probability(deck, sims: int = 10000, card_names: list[str] | None = None):
