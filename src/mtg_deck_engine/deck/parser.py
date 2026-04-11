@@ -121,27 +121,40 @@ def parse_decklist(text: str) -> list[DeckEntry]:
 
 
 def parse_csv(text: str) -> list[DeckEntry]:
-    """Parse CSV-format decklist (quantity,name,zone)."""
+    """Parse CSV-format decklist (quantity,name,zone).
+
+    Uses Python's csv module to correctly handle quoted fields
+    (e.g. card names with commas like "Jace, the Mind Sculptor").
+    """
+    import csv
+    import io
+
     entries: list[DeckEntry] = []
-    for line in text.strip().splitlines():
-        line = line.strip()
-        if not line or line.startswith("quantity") or line.startswith("Quantity"):
+    reader = csv.reader(io.StringIO(text.strip()))
+    for row in reader:
+        if not row:
             continue
-        parts = [p.strip().strip('"') for p in line.split(",")]
-        if len(parts) >= 2:
-            try:
-                qty = int(parts[0])
-            except ValueError:
-                continue
-            name = parts[1]
-            zone = Zone.MAINBOARD
-            if len(parts) >= 3:
-                zone_str = parts[2].lower()
-                for z in Zone:
-                    if z.value == zone_str:
-                        zone = z
-                        break
-            entries.append(DeckEntry(card_name=name, quantity=qty, zone=zone))
+        # Skip header row
+        first = row[0].strip().lower()
+        if first in ("quantity", "qty", "count"):
+            continue
+        if len(row) < 2:
+            continue
+        try:
+            qty = int(row[0].strip())
+        except ValueError:
+            continue
+        name = row[1].strip()
+        if not name:
+            continue
+        zone = Zone.MAINBOARD
+        if len(row) >= 3:
+            zone_str = row[2].strip().lower()
+            for z in Zone:
+                if z.value == zone_str:
+                    zone = z
+                    break
+        entries.append(DeckEntry(card_name=name, quantity=qty, zone=zone))
     return entries
 
 

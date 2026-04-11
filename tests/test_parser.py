@@ -94,6 +94,23 @@ def test_csv_format():
     assert entries[0].quantity == 4
 
 
+def test_csv_comma_in_name():
+    text = '4,"Jace, the Mind Sculptor",mainboard\n2,"Mountain",sideboard\n'
+    entries = parse_csv(text)
+    assert len(entries) == 2
+    assert entries[0].card_name == "Jace, the Mind Sculptor"
+    assert entries[0].quantity == 4
+    assert entries[1].card_name == "Mountain"
+    assert entries[1].zone == Zone.SIDEBOARD
+
+
+def test_csv_no_quotes():
+    text = "4,Lightning Bolt,mainboard\n2,Mountain,mainboard\n"
+    entries = parse_csv(text)
+    assert len(entries) == 2
+    assert entries[0].card_name == "Lightning Bolt"
+
+
 def test_auto_detect_text():
     text = "4 Lightning Bolt\n4 Mountain\n"
     entries = parse_auto(text)

@@ -10,27 +10,15 @@ from pathlib import Path
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
-from mtg_deck_engine.analysis.static import analyze_deck
+
+# Core imports needed by most commands
 from mtg_deck_engine.data.database import CardDatabase
-from mtg_deck_engine.data.scryfall import ingest
-from mtg_deck_engine.deck.parser import parse_auto
-from mtg_deck_engine.deck.resolver import resolve_deck
-from mtg_deck_engine.deck.validator import validate_deck
 from mtg_deck_engine.legal import ATTRIBUTION, DISCLAIMER
-from mtg_deck_engine.models import AnalysisResult, Format
-from mtg_deck_engine.probability.key_cards import analyze_card_access, analyze_role_access
-from mtg_deck_engine.probability.mana_development import ManaDevelopmentReport, analyze_mana_development
-from mtg_deck_engine.probability.opening_hand import OpeningHandReport, simulate_opening_hands
-from mtg_deck_engine.goldfish.runner import GoldfishReport, run_goldfish_batch
-from mtg_deck_engine.matchup.archetypes import ArchetypeName, get_archetype, get_default_gauntlet
-from mtg_deck_engine.matchup.gauntlet import GauntletReport, run_gauntlet
-from mtg_deck_engine.versioning.impact import ImpactReport, analyze_impact
-from mtg_deck_engine.versioning.storage import VersionStore, diff_versions
-from mtg_deck_engine.versioning.trends import TrendReport, analyze_trends
-from mtg_deck_engine.analysis.advanced import AdvancedReport, run_advanced_analysis
-from mtg_deck_engine.benchmarks.suites import get_suite, list_suites
-from mtg_deck_engine.export.exporter import export_html, export_json, export_markdown
-from mtg_deck_engine.formats.profiles import detect_archetype, format_recommendations, get_format_profile
+from mtg_deck_engine.models import Format
+
+# Heavy imports are lazy-loaded inside command functions to speed up
+# simple commands like `info` and `search`. Each cmd_* function imports
+# only what it needs.
 
 console = Console()
 
@@ -112,7 +100,7 @@ def main():
     gt_parser.add_argument("--turns", type=int, default=12, help="Max turns per game (default: 12)")
     gt_parser.add_argument(
         "--suite", type=str, default=None,
-        help=f"Benchmark suite ({', '.join(list_suites())})",
+        help="Benchmark suite (casual-commander, cedh, modern-meta, standard-meta, aggro-gauntlet, control-gauntlet)",
     )
 
     # save command
@@ -180,6 +168,8 @@ def _get_db(args) -> CardDatabase:
 
 
 def cmd_ingest(args):
+    from mtg_deck_engine.data.scryfall import ingest
+
     db = _get_db(args)
     try:
         asyncio.run(ingest(db=db, force=args.force))
@@ -188,6 +178,15 @@ def cmd_ingest(args):
 
 
 def cmd_analyze(args):
+    from mtg_deck_engine.analysis.advanced import run_advanced_analysis
+    from mtg_deck_engine.analysis.static import analyze_deck
+    from mtg_deck_engine.deck.parser import parse_auto
+    from mtg_deck_engine.deck.resolver import resolve_deck
+    from mtg_deck_engine.deck.validator import validate_deck
+    from mtg_deck_engine.export.exporter import export_html, export_json, export_markdown
+    from mtg_deck_engine.formats.profiles import detect_archetype, format_recommendations
+    from mtg_deck_engine.models import AnalysisResult
+
     db = _get_db(args)
     try:
         # Check database has cards
@@ -313,6 +312,9 @@ def cmd_info(args):
 
 def cmd_probability(args):
     """Dedicated probability analysis command."""
+    from mtg_deck_engine.deck.parser import parse_auto
+    from mtg_deck_engine.deck.resolver import resolve_deck
+
     db = _get_db(args)
     try:
         if db.card_count() == 0:
@@ -356,6 +358,10 @@ def cmd_probability(args):
 
 def cmd_goldfish(args):
     """Run goldfish simulation."""
+    from mtg_deck_engine.deck.parser import parse_auto
+    from mtg_deck_engine.deck.resolver import resolve_deck
+    from mtg_deck_engine.goldfish.runner import run_goldfish_batch
+
     db = _get_db(args)
     try:
         if db.card_count() == 0:
@@ -401,6 +407,11 @@ def cmd_goldfish(args):
 
 def cmd_gauntlet(args):
     """Run matchup gauntlet against archetype field."""
+    from mtg_deck_engine.benchmarks.suites import get_suite, list_suites
+    from mtg_deck_engine.deck.parser import parse_auto
+    from mtg_deck_engine.deck.resolver import resolve_deck
+    from mtg_deck_engine.matchup.gauntlet import run_gauntlet
+
     db = _get_db(args)
     try:
         if db.card_count() == 0:
@@ -456,6 +467,11 @@ def cmd_gauntlet(args):
 
 def cmd_save(args):
     """Save a deck version snapshot with analysis scores."""
+    from mtg_deck_engine.analysis.static import analyze_deck
+    from mtg_deck_engine.deck.parser import parse_auto
+    from mtg_deck_engine.deck.resolver import resolve_deck
+    from mtg_deck_engine.versioning.storage import VersionStore
+
     db = _get_db(args)
     try:
         if db.card_count() == 0:
@@ -528,6 +544,9 @@ def cmd_save(args):
 
 def cmd_compare(args):
     """Compare two versions of a deck."""
+    from mtg_deck_engine.versioning.impact import analyze_impact
+    from mtg_deck_engine.versioning.storage import VersionStore, diff_versions
+
     store = VersionStore()
     try:
         versions = store.get_all_versions(args.deck_id)
@@ -556,6 +575,9 @@ def cmd_compare(args):
 
 def cmd_history(args):
     """Show deck version history and trends."""
+    from mtg_deck_engine.versioning.storage import VersionStore
+    from mtg_deck_engine.versioning.trends import analyze_trends
+
     store = VersionStore()
     try:
         if args.deck_id is None:
@@ -622,6 +644,10 @@ def cmd_history(args):
 
 def _run_and_render_probability(deck, sims: int = 10000, card_names: list[str] | None = None):
     """Run all probability analyses and render results."""
+    from mtg_deck_engine.probability.key_cards import analyze_card_access, analyze_role_access
+    from mtg_deck_engine.probability.mana_development import analyze_mana_development
+    from mtg_deck_engine.probability.opening_hand import simulate_opening_hands
+
     console.print()
     console.print("[bold magenta]--- Probability Analysis ---[/bold magenta]")
 
