@@ -27,6 +27,10 @@ from mtg_deck_engine.matchup.gauntlet import GauntletReport, run_gauntlet
 from mtg_deck_engine.versioning.impact import ImpactReport, analyze_impact
 from mtg_deck_engine.versioning.storage import VersionStore, diff_versions
 from mtg_deck_engine.versioning.trends import TrendReport, analyze_trends
+from mtg_deck_engine.analysis.advanced import AdvancedReport, run_advanced_analysis
+from mtg_deck_engine.benchmarks.suites import get_suite, list_suites
+from mtg_deck_engine.export.exporter import export_html, export_json, export_markdown
+from mtg_deck_engine.formats.profiles import detect_archetype, format_recommendations, get_format_profile
 
 console = Console()
 
@@ -67,6 +71,10 @@ def main():
         "--sims", type=int, default=10000,
         help="Number of Monte Carlo simulations for opening hand analysis (default: 10000)",
     )
+    analyze_parser.add_argument(
+        "--export", type=str, default=None,
+        help="Export report to file (supports .json, .md, .html)",
+    )
 
     # probability command
     prob_parser = subparsers.add_parser("probability", help="Run probability analysis on a decklist")
@@ -102,6 +110,10 @@ def main():
     gt_parser.add_argument("--db", type=str, help="Custom database path")
     gt_parser.add_argument("--sims", type=int, default=500, help="Games per matchup (default: 500)")
     gt_parser.add_argument("--turns", type=int, default=12, help="Max turns per game (default: 12)")
+    gt_parser.add_argument(
+        "--suite", type=str, default=None,
+        help=f"Benchmark suite ({', '.join(list_suites())})",
+    )
 
     # save command
     save_parser = subparsers.add_parser("save", help="Save a deck version snapshot")
@@ -212,12 +224,47 @@ def cmd_analyze(args):
         result = analyze_deck(deck)
         result.issues.extend(issues)
 
+        # Archetype detection
+        archetype = detect_archetype(deck)
+        fmt_recs = format_recommendations(deck, archetype)
+        result.recommendations.extend(fmt_recs)
+
+        # Advanced heuristics
+        adv = run_advanced_analysis(deck, result.color_sources)
+        result.recommendations.extend(adv.advanced_recommendations)
+
         # Display
         _render_dashboard(result, deck)
+
+        # Archetype and advanced
+        if archetype.value != "unknown":
+            console.print(f"  [bold]Detected Archetype:[/bold] {archetype.value.replace('_', ' ').title()}")
+        if adv.mana_base_grade:
+            console.print(f"  [bold]Mana Base Grade:[/bold] {adv.mana_base_grade}")
+        if adv.synergies:
+            console.print(f"  [bold]Synergies Found:[/bold] {len(adv.synergies)}")
+        console.print()
 
         # Probability layer (--deep)
         if hasattr(args, "deep") and args.deep:
             _run_and_render_probability(deck, args.sims)
+
+        # Export
+        if hasattr(args, "export") and args.export:
+            export_path = Path(args.export)
+            adv_dict = {
+                "mana_base_grade": adv.mana_base_grade,
+                "mana_base_notes": adv.mana_base_notes,
+                "synergies": [{"card_a": s.card_a, "card_b": s.card_b, "reason": s.reason} for s in adv.synergies],
+                "advanced_recommendations": adv.advanced_recommendations,
+            }
+            if export_path.suffix == ".json":
+                export_json(result, adv_dict, archetype.value, export_path)
+            elif export_path.suffix == ".html":
+                export_html(result, adv_dict, archetype.value, export_path)
+            else:
+                export_markdown(result, adv_dict, archetype.value, export_path)
+            console.print(f"[green]Report exported to {export_path}[/green]")
 
     finally:
         db.close()
@@ -386,7 +433,18 @@ def cmd_gauntlet(args):
             )
         )
 
-        report = run_gauntlet(deck, simulations=args.sims, max_turns=args.turns)
+        # Resolve suite
+        archetypes = None
+        if hasattr(args, "suite") and args.suite:
+            suite = get_suite(args.suite)
+            if suite:
+                archetypes = suite.archetypes
+                console.print(f"[cyan]Using suite: {suite.name} — {suite.description}[/cyan]")
+            else:
+                console.print(f"[yellow]Suite '{args.suite}' not found. Available: {', '.join(list_suites())}[/yellow]")
+                console.print("[dim]Using default gauntlet.[/dim]")
+
+        report = run_gauntlet(deck, archetypes=archetypes, simulations=args.sims, max_turns=args.turns)
         _render_gauntlet_report(report)
 
         console.print(f"\n[dim]{ATTRIBUTION}[/dim]")

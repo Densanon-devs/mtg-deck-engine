@@ -43,6 +43,12 @@ mtg-engine compare my-deck-id
 # View version history and trends
 mtg-engine history my-deck-id
 
+# Export report (JSON, Markdown, or HTML)
+mtg-engine analyze my_deck.txt --format commander --export report.html
+
+# Run gauntlet with a specific meta suite
+mtg-engine gauntlet my_deck.txt --suite cedh
+
 # Search cards
 mtg-engine search "Lightning Bolt"
 
@@ -89,7 +95,7 @@ All card data and basic analysis are **free forever**. Monetization is feature-g
 - [x] Phase 3: Goldfish simulation engine (Pro)
 - [x] Phase 4: Matchup framework and benchmark gauntlet (Pro)
 - [x] Phase 5: Version comparison and change tracking (Pro)
-- [ ] Phase 6: Advanced heuristics and format modules (Pro)
+- [x] Phase 6: Advanced heuristics and format modules (Pro)
 
 ## Legal
 
