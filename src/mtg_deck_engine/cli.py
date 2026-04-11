@@ -21,6 +21,7 @@ from mtg_deck_engine.models import AnalysisResult, Format
 from mtg_deck_engine.probability.key_cards import analyze_card_access, analyze_role_access
 from mtg_deck_engine.probability.mana_development import ManaDevelopmentReport, analyze_mana_development
 from mtg_deck_engine.probability.opening_hand import OpeningHandReport, simulate_opening_hands
+from mtg_deck_engine.goldfish.runner import GoldfishReport, run_goldfish_batch
 
 console = Console()
 
@@ -75,6 +76,17 @@ def main():
         "--card", action="append", dest="cards", help="Track specific card (repeatable)",
     )
 
+    # goldfish command
+    gf_parser = subparsers.add_parser("goldfish", help="Run goldfish (solo) simulation")
+    gf_parser.add_argument("file", type=str, help="Path to decklist file")
+    gf_parser.add_argument("--name", type=str, default=None, help="Deck name")
+    gf_parser.add_argument(
+        "--format", type=str, default=None, choices=[f.value for f in Format], help="Deck format",
+    )
+    gf_parser.add_argument("--db", type=str, help="Custom database path")
+    gf_parser.add_argument("--sims", type=int, default=1000, help="Number of games to simulate")
+    gf_parser.add_argument("--turns", type=int, default=10, help="Max turns per game (default: 10)")
+
     # search command
     search_parser = subparsers.add_parser("search", help="Search for cards")
     search_parser.add_argument("query", type=str, help="Search query")
@@ -96,6 +108,8 @@ def main():
         cmd_analyze(args)
     elif args.command == "probability":
         cmd_probability(args)
+    elif args.command == "goldfish":
+        cmd_goldfish(args)
     elif args.command == "search":
         cmd_search(args)
     elif args.command == "info":
@@ -240,6 +254,51 @@ def cmd_probability(args):
         )
 
         _run_and_render_probability(deck, args.sims, card_names=args.cards)
+
+        console.print(f"\n[dim]{ATTRIBUTION}[/dim]")
+        console.print(f"[dim]{DISCLAIMER}[/dim]\n")
+
+    finally:
+        db.close()
+
+
+def cmd_goldfish(args):
+    """Run goldfish simulation."""
+    db = _get_db(args)
+    try:
+        if db.card_count() == 0:
+            console.print("[red]No cards in database. Run 'mtg-engine ingest' first.[/red]")
+            sys.exit(1)
+
+        file_path = Path(args.file)
+        if not file_path.exists():
+            console.print(f"[red]File not found: {file_path}[/red]")
+            sys.exit(1)
+
+        text = file_path.read_text(encoding="utf-8")
+        deck_name = args.name or file_path.stem
+
+        entries = parse_auto(text)
+        if not entries:
+            console.print("[red]No cards found in decklist.[/red]")
+            sys.exit(1)
+
+        fmt = Format(args.format) if args.format else None
+        deck = resolve_deck(entries, db, name=deck_name, format=fmt)
+
+        console.print(
+            Panel(
+                f"[bold]{deck_name}[/bold]"
+                + (f"  |  Format: {deck.format.value}" if deck.format else "")
+                + f"  |  {deck.total_cards} cards",
+                title="[bold cyan]MTG Deck Engine — Goldfish Simulation[/bold cyan]",
+                border_style="cyan",
+            )
+        )
+
+        console.print(f"[dim]Running {args.sims} goldfish games ({args.turns} turns each)...[/dim]")
+        report = run_goldfish_batch(deck, simulations=args.sims, max_turns=args.turns)
+        _render_goldfish_report(report)
 
         console.print(f"\n[dim]{ATTRIBUTION}[/dim]")
         console.print(f"[dim]{DISCLAIMER}[/dim]\n")
@@ -706,6 +765,109 @@ def _inverse_prob_rating(prob: float) -> str:
         return "[red]Weak[/red]"
     else:
         return "[bold red]Critical[/bold red]"
+
+
+# =============================================================================
+# Goldfish rendering
+# =============================================================================
+
+
+def _render_goldfish_report(report: GoldfishReport):
+    """Render goldfish simulation results."""
+    console.print()
+
+    # Summary
+    kill_info = f"Avg Kill Turn: {report.average_kill_turn}" if report.kill_rate > 0 else "No kills in sim window"
+    cmd_info = f"Cmdr Cast Rate: {report.commander_cast_rate * 100:.0f}% (avg T{report.average_commander_turn})" if report.commander_cast_rate > 0 else ""
+
+    summary = (
+        f"[bold]Games:[/bold] {report.simulations:,}  |  "
+        f"[bold]Turns:[/bold] {report.max_turns}  |  "
+        f"[bold]Avg Mulligans:[/bold] {report.average_mulligans:.1f}  |  "
+        f"[bold]Avg Spells/Game:[/bold] {report.average_spells_cast}"
+    )
+    if report.kill_rate > 0:
+        summary += f"\n[bold]Kill Rate:[/bold] {report.kill_rate * 100:.1f}%  |  {kill_info}"
+    if cmd_info:
+        summary += f"\n{cmd_info}"
+
+    console.print(Panel(summary, title="[bold red]Goldfish Results[/bold red]", border_style="red"))
+
+    # Turn-by-turn progression
+    prog_table = Table(title="Turn-by-Turn Progression (averages)", show_header=True, header_style="bold")
+    prog_table.add_column("Turn", justify="center", width=5)
+    prog_table.add_column("Lands", justify="right", width=6)
+    prog_table.add_column("Creatures", justify="right", width=9)
+    prog_table.add_column("Power", justify="right", width=6)
+    prog_table.add_column("Mana Spent", justify="right", width=10)
+    prog_table.add_column("Spells", justify="right", width=7)
+    prog_table.add_column("Cum. Dmg", justify="right", width=8)
+
+    for turn in range(1, report.max_turns + 1):
+        lands = report.average_lands_by_turn.get(turn, 0)
+        creatures = report.average_creatures_by_turn.get(turn, 0)
+        mana = report.average_mana_spent_by_turn.get(turn, 0)
+        casts = report.average_cards_cast_by_turn.get(turn, 0)
+        damage = report.average_damage_by_turn.get(turn, 0)
+
+        # Estimate avg power from damage delta
+        prev_dmg = report.average_damage_by_turn.get(turn - 1, 0) if turn > 1 else 0
+        turn_dmg = damage - prev_dmg
+
+        prog_table.add_row(
+            str(turn),
+            f"{lands:.1f}",
+            f"{creatures:.1f}",
+            f"{turn_dmg:.0f}",
+            f"{mana:.1f}",
+            f"{casts:.1f}",
+            f"{damage:.0f}",
+        )
+
+    console.print(prog_table)
+
+    # Kill turn distribution
+    if report.kill_turn_distribution:
+        kill_table = Table(title="Kill Turn Distribution", show_header=True, header_style="bold red")
+        kill_table.add_column("Turn", justify="center", width=6)
+        kill_table.add_column("Rate", justify="right", width=8)
+        kill_table.add_column("", min_width=25)
+
+        for turn, rate in sorted(report.kill_turn_distribution.items()):
+            bar_len = int(rate * 40)
+            bar = "█" * bar_len
+            kill_table.add_row(str(turn), f"{rate * 100:.1f}%", f"[red]{bar}[/red]")
+
+        console.print(kill_table)
+
+    # Objectives
+    if report.objective_pass_rates:
+        obj_table = Table(title="Objective Pass Rates", show_header=True, header_style="bold green")
+        obj_table.add_column("Objective", width=30)
+        obj_table.add_column("Pass Rate", justify="right", width=10)
+        obj_table.add_column("Rating", width=12)
+
+        for name, rate in report.objective_pass_rates.items():
+            pct = f"{rate * 100:.1f}%"
+            rating = _prob_rating(rate)
+            obj_table.add_row(name, pct, rating)
+
+        console.print(obj_table)
+
+    # Most-cast spells
+    if report.most_cast_spells:
+        spell_table = Table(title="Most-Cast Spells", show_header=True, header_style="bold")
+        spell_table.add_column("Card", width=28)
+        spell_table.add_column("Times Cast", justify="right", width=10)
+        spell_table.add_column("Per Game", justify="right", width=8)
+
+        for name, count in report.most_cast_spells[:8]:
+            per_game = count / report.simulations if report.simulations > 0 else 0
+            spell_table.add_row(name, str(count), f"{per_game:.2f}")
+
+        console.print(spell_table)
+
+    console.print()
 
 
 if __name__ == "__main__":
