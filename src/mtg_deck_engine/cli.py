@@ -24,6 +24,9 @@ from mtg_deck_engine.probability.opening_hand import OpeningHandReport, simulate
 from mtg_deck_engine.goldfish.runner import GoldfishReport, run_goldfish_batch
 from mtg_deck_engine.matchup.archetypes import ArchetypeName, get_archetype, get_default_gauntlet
 from mtg_deck_engine.matchup.gauntlet import GauntletReport, run_gauntlet
+from mtg_deck_engine.versioning.impact import ImpactReport, analyze_impact
+from mtg_deck_engine.versioning.storage import VersionStore, diff_versions
+from mtg_deck_engine.versioning.trends import TrendReport, analyze_trends
 
 console = Console()
 
@@ -100,6 +103,27 @@ def main():
     gt_parser.add_argument("--sims", type=int, default=500, help="Games per matchup (default: 500)")
     gt_parser.add_argument("--turns", type=int, default=12, help="Max turns per game (default: 12)")
 
+    # save command
+    save_parser = subparsers.add_parser("save", help="Save a deck version snapshot")
+    save_parser.add_argument("file", type=str, help="Path to decklist file")
+    save_parser.add_argument("deck_id", type=str, help="Unique deck identifier (e.g. 'atraxa-superfriends')")
+    save_parser.add_argument("--name", type=str, default=None, help="Deck name")
+    save_parser.add_argument(
+        "--format", type=str, default=None, choices=[f.value for f in Format], help="Deck format",
+    )
+    save_parser.add_argument("--notes", type=str, default="", help="Version notes")
+    save_parser.add_argument("--db", type=str, help="Custom database path")
+
+    # compare command
+    cmp_parser = subparsers.add_parser("compare", help="Compare two deck versions")
+    cmp_parser.add_argument("deck_id", type=str, help="Deck identifier")
+    cmp_parser.add_argument("--v1", type=int, default=None, help="First version (default: previous)")
+    cmp_parser.add_argument("--v2", type=int, default=None, help="Second version (default: latest)")
+
+    # history command
+    hist_parser = subparsers.add_parser("history", help="Show deck version history and trends")
+    hist_parser.add_argument("deck_id", nargs="?", default=None, help="Deck identifier (omit to list all)")
+
     # search command
     search_parser = subparsers.add_parser("search", help="Search for cards")
     search_parser.add_argument("query", type=str, help="Search query")
@@ -125,6 +149,12 @@ def main():
         cmd_goldfish(args)
     elif args.command == "gauntlet":
         cmd_gauntlet(args)
+    elif args.command == "save":
+        cmd_save(args)
+    elif args.command == "compare":
+        cmd_compare(args)
+    elif args.command == "history":
+        cmd_history(args)
     elif args.command == "search":
         cmd_search(args)
     elif args.command == "info":
@@ -364,6 +394,171 @@ def cmd_gauntlet(args):
 
     finally:
         db.close()
+
+
+def cmd_save(args):
+    """Save a deck version snapshot with analysis scores."""
+    db = _get_db(args)
+    try:
+        if db.card_count() == 0:
+            console.print("[red]No cards in database. Run 'mtg-engine ingest' first.[/red]")
+            sys.exit(1)
+
+        file_path = Path(args.file)
+        if not file_path.exists():
+            console.print(f"[red]File not found: {file_path}[/red]")
+            sys.exit(1)
+
+        text = file_path.read_text(encoding="utf-8")
+        deck_name = args.name or file_path.stem
+        fmt = Format(args.format) if args.format else None
+
+        entries = parse_auto(text)
+        if not entries:
+            console.print("[red]No cards found in decklist.[/red]")
+            sys.exit(1)
+
+        deck = resolve_deck(entries, db, name=deck_name, format=fmt)
+
+        # Run analysis to capture scores
+        result = analyze_deck(deck)
+
+        # Build decklist and zone maps
+        decklist = {}
+        zones: dict[str, list[str]] = {}
+        for entry in deck.entries:
+            decklist[entry.card_name] = decklist.get(entry.card_name, 0) + entry.quantity
+            zone_name = entry.zone.value
+            zones.setdefault(zone_name, []).append(entry.card_name)
+
+        # Collect metrics
+        metrics = {
+            "land_count": float(result.land_count),
+            "ramp_count": float(result.ramp_count),
+            "draw_count": float(result.draw_engine_count),
+            "interaction_count": float(result.interaction_count),
+            "threat_count": float(result.threat_count),
+            "average_cmc": result.average_cmc,
+            "total_cards": float(result.total_cards),
+        }
+
+        # Save
+        store = VersionStore()
+        snap = store.save_version(
+            deck_id=args.deck_id,
+            name=deck_name,
+            format=deck.format.value if deck.format else None,
+            decklist=decklist,
+            zones=zones,
+            scores=result.scores,
+            metrics=metrics,
+            notes=args.notes,
+        )
+        store.close()
+
+        console.print(
+            f"[bold green]Saved {deck_name} v{snap.version_number}[/bold green] "
+            f"(id: {args.deck_id}, {len(decklist)} unique cards)"
+        )
+        if args.notes:
+            console.print(f"  [dim]Notes: {args.notes}[/dim]")
+
+    finally:
+        db.close()
+
+
+def cmd_compare(args):
+    """Compare two versions of a deck."""
+    store = VersionStore()
+    try:
+        versions = store.get_all_versions(args.deck_id)
+        if len(versions) < 2:
+            console.print(f"[yellow]Need at least 2 saved versions to compare. Found {len(versions)}.[/yellow]")
+            return
+
+        v1_num = args.v1 if args.v1 else versions[-2].version_number
+        v2_num = args.v2 if args.v2 else versions[-1].version_number
+
+        snap_a = store.get_version(args.deck_id, v1_num)
+        snap_b = store.get_version(args.deck_id, v2_num)
+
+        if not snap_a or not snap_b:
+            console.print(f"[red]Version not found. Available: {[v.version_number for v in versions]}[/red]")
+            return
+
+        diff = diff_versions(snap_a, snap_b)
+        impact = analyze_impact(snap_a, snap_b, diff)
+
+        _render_comparison(impact)
+
+    finally:
+        store.close()
+
+
+def cmd_history(args):
+    """Show deck version history and trends."""
+    store = VersionStore()
+    try:
+        if args.deck_id is None:
+            # List all decks
+            decks = store.list_decks()
+            if not decks:
+                console.print("[yellow]No saved decks found. Use 'mtg-engine save' to save a deck.[/yellow]")
+                return
+
+            table = Table(title="Saved Decks", show_header=True, header_style="bold")
+            table.add_column("Deck ID", width=25)
+            table.add_column("Name", width=25)
+            table.add_column("Format", width=12)
+            table.add_column("Versions", justify="right", width=9)
+            table.add_column("Last Updated", width=20)
+
+            for d in decks:
+                table.add_row(
+                    d["deck_id"], d["name"], d["format"] or "—",
+                    str(d["versions"]), d["updated_at"][:16],
+                )
+
+            console.print(table)
+            return
+
+        # Show history for specific deck
+        versions = store.get_all_versions(args.deck_id)
+        if not versions:
+            console.print(f"[yellow]No versions found for deck '{args.deck_id}'[/yellow]")
+            return
+
+        console.print(Panel(
+            f"[bold]{args.deck_id}[/bold]  |  {len(versions)} version(s)",
+            title="[bold cyan]Deck Version History[/bold cyan]",
+            border_style="cyan",
+        ))
+
+        # Version list
+        v_table = Table(title="Versions", show_header=True, header_style="bold")
+        v_table.add_column("V#", justify="right", width=4)
+        v_table.add_column("Saved At", width=18)
+        v_table.add_column("Cards", justify="right", width=6)
+        v_table.add_column("Notes", width=35)
+
+        for v in versions:
+            total_cards = sum(v.decklist.values())
+            v_table.add_row(
+                str(v.version_number),
+                v.saved_at[:16],
+                str(total_cards),
+                v.notes or "—",
+            )
+
+        console.print(v_table)
+
+        # Trend analysis
+        if len(versions) >= 2:
+            trend_report = analyze_trends(versions)
+            _render_trends(trend_report)
+
+    finally:
+        store.close()
 
 
 def _run_and_render_probability(deck, sims: int = 10000, card_names: list[str] | None = None):
@@ -1003,6 +1198,136 @@ def _render_gauntlet_report(report: GauntletReport):
         score_table.add_row(name, f"{score:.0f}", _score_rating(score))
 
     console.print(score_table)
+    console.print()
+
+
+# =============================================================================
+# Version comparison rendering
+# =============================================================================
+
+
+def _render_comparison(impact: ImpactReport):
+    """Render version comparison report."""
+    console.print()
+    diff = impact.diff
+
+    # Verdict banner
+    verdict_colors = {
+        "improved": "bold green",
+        "regressed": "bold red",
+        "mixed": "bold yellow",
+        "neutral": "dim",
+    }
+    vc = verdict_colors.get(impact.overall_verdict, "dim")
+    console.print(Panel(
+        f"[bold]v{impact.version_a} -> v{impact.version_b}[/bold]  |  "
+        f"Verdict: [{vc}]{impact.overall_verdict.upper()}[/{vc}]",
+        title="[bold cyan]Version Comparison[/bold cyan]",
+        border_style="cyan",
+    ))
+
+    # Card changes
+    if diff and (diff.added or diff.removed or diff.changed_qty):
+        card_table = Table(title="Card Changes", show_header=True, header_style="bold")
+        card_table.add_column("Change", width=8)
+        card_table.add_column("Card", width=30)
+        card_table.add_column("Qty", justify="right", width=8)
+
+        for card, qty in sorted(diff.added.items()):
+            card_table.add_row("[green]+ ADD[/green]", card, f"+{qty}")
+        for card, qty in sorted(diff.removed.items()):
+            card_table.add_row("[red]- CUT[/red]", card, f"-{qty}")
+        for card, (old, new) in sorted(diff.changed_qty.items()):
+            delta = new - old
+            sign = "+" if delta > 0 else ""
+            color = "green" if delta > 0 else "red"
+            card_table.add_row(f"[{color}]~ CHG[/{color}]", card, f"{old}->{new} ({sign}{delta})")
+
+        console.print(card_table)
+        console.print(f"  [dim]Total: +{diff.total_added} / -{diff.total_removed}[/dim]")
+
+    # Score deltas
+    if impact.score_deltas:
+        score_table = Table(title="Score Impact", show_header=True, header_style="bold")
+        score_table.add_column("Category", width=18)
+        score_table.add_column("Before", justify="right", width=8)
+        score_table.add_column("After", justify="right", width=8)
+        score_table.add_column("Delta", justify="right", width=8)
+        score_table.add_column("", width=8)
+
+        for key, delta in impact.score_deltas.items():
+            name = key.replace("_", " ").title()
+            old = impact.score_a.get(key, 0)
+            new = impact.score_b.get(key, 0)
+            if abs(delta) < 1:
+                indicator = "[dim]—[/dim]"
+            elif delta > 0:
+                indicator = "[green]^[/green]"
+            else:
+                indicator = "[red]v[/red]"
+            score_table.add_row(name, f"{old:.0f}", f"{new:.0f}", f"{delta:+.0f}", indicator)
+
+        console.print(score_table)
+
+    # Improvements and regressions
+    if impact.improvements:
+        console.print(Panel(
+            "\n".join(f"  [green]+[/green] {s}" for s in impact.improvements),
+            title="[green]Improvements[/green]",
+            border_style="green",
+        ))
+
+    if impact.regressions:
+        console.print(Panel(
+            "\n".join(f"  [red]-[/red] {s}" for s in impact.regressions),
+            title="[red]Regressions[/red]",
+            border_style="red",
+        ))
+
+    console.print()
+
+
+def _render_trends(report: TrendReport):
+    """Render trend analysis."""
+    if not report.score_trends:
+        return
+
+    console.print()
+    table = Table(title="Score Trends", show_header=True, header_style="bold magenta")
+    table.add_column("Score", width=18)
+    table.add_column("Current", justify="right", width=8)
+    table.add_column("Best", justify="right", width=6)
+    table.add_column("Worst", justify="right", width=6)
+    table.add_column("Overall", justify="right", width=8)
+    table.add_column("Recent", justify="right", width=8)
+    table.add_column("Direction", width=12)
+
+    direction_styles = {
+        "improving": "[green]Improving[/green]",
+        "declining": "[red]Declining[/red]",
+        "stable": "[dim]Stable[/dim]",
+        "volatile": "[yellow]Volatile[/yellow]",
+    }
+
+    for key, trend in report.score_trends.items():
+        overall = f"{trend.delta_first_to_last:+.0f}"
+        recent = f"{trend.delta_recent:+.0f}" if trend.delta_recent != 0 else "—"
+        direction = direction_styles.get(trend.direction, trend.direction)
+        table.add_row(
+            trend.name, f"{trend.current:.0f}", f"{trend.best:.0f}", f"{trend.worst:.0f}",
+            overall, recent, direction,
+        )
+
+    console.print(table)
+
+    # Suggestions
+    if report.suggestions:
+        console.print(Panel(
+            "\n".join(f"  • {s}" for s in report.suggestions),
+            title="[bold green]Suggestions[/bold green]",
+            border_style="green",
+        ))
+
     console.print()
 
 

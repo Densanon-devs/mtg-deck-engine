@@ -34,6 +34,15 @@ mtg-engine goldfish my_deck.txt --format commander --sims 1000 --turns 10
 # Meta gauntlet (matchup testing vs archetype field)
 mtg-engine gauntlet my_deck.txt --format commander --sims 500
 
+# Save a deck version snapshot
+mtg-engine save my_deck.txt my-deck-id --notes "Added more ramp"
+
+# Compare two versions
+mtg-engine compare my-deck-id
+
+# View version history and trends
+mtg-engine history my-deck-id
+
 # Search cards
 mtg-engine search "Lightning Bolt"
 
@@ -79,7 +88,7 @@ All card data and basic analysis are **free forever**. Monetization is feature-g
 - [x] Phase 2: Opening hand / mana probability calculator
 - [x] Phase 3: Goldfish simulation engine (Pro)
 - [x] Phase 4: Matchup framework and benchmark gauntlet (Pro)
-- [ ] Phase 5: Version comparison and change tracking (Pro)
+- [x] Phase 5: Version comparison and change tracking (Pro)
 - [ ] Phase 6: Advanced heuristics and format modules (Pro)
 
 ## Legal
