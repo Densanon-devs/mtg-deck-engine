@@ -17,3 +17,13 @@ data/bulk/
 .pytest_cache/
 .mypy_cache/
 *.log
+
+# License keys — never commit private keys
+scripts/dev_private_key.txt
+scripts/*_private_key*
+*.license.key
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec.bak

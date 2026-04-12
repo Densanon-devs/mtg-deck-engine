@@ -8,11 +8,15 @@ PYTHON = sys.executable
 
 def _run_cli(*args: str) -> subprocess.CompletedProcess:
     """Run mtg-engine CLI with given args."""
+    import os
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
     return subprocess.run(
         [PYTHON, "-m", "mtg_deck_engine.cli", *args],
         capture_output=True,
-        text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=10,
+        env=env,
     )
 
 

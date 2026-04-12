@@ -13,6 +13,16 @@ from rich.table import Table
 
 # Use safe console that handles piped output and non-UTF-8 terminals
 import io as _io, sys as _sys
+
+# Force stdout/stderr to UTF-8 on Windows to avoid cp1252 encoding errors
+# with Rich's box-drawing characters when running the bundled binary
+if _sys.platform == "win32":
+    try:
+        _sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        _sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError):
+        pass
+
 _force_terminal = _sys.stdout.isatty() if hasattr(_sys.stdout, "isatty") else False
 
 # Core imports needed by most commands
@@ -155,6 +165,14 @@ def main():
     practice_parser.add_argument("--db", type=str, help="Custom database path")
     practice_parser.add_argument("--rounds", type=int, default=10, help="Number of practice rounds")
 
+    # license command
+    lic_parser = subparsers.add_parser("license", help="Manage Pro license key")
+    lic_subs = lic_parser.add_subparsers(dest="license_action")
+    lic_activate = lic_subs.add_parser("activate", help="Activate a license key")
+    lic_activate.add_argument("key", type=str, help="License key from purchase")
+    lic_subs.add_parser("show", help="Show current license info")
+    lic_subs.add_parser("remove", help="Remove the saved license")
+
     # info command
     info_parser = subparsers.add_parser("info", help="Show database info")
     info_parser.add_argument("--db", type=str, help="Custom database path")
@@ -198,6 +216,8 @@ def main():
         cmd_search(args)
     elif command == "info":
         cmd_info(args)
+    elif command == "license":
+        cmd_license(args)
 
 
 def _get_db(args) -> CardDatabase:
@@ -410,14 +430,94 @@ def cmd_info(args):
     try:
         count = db.card_count()
         last_ingest = db.get_metadata("last_ingest")
+
+        # Show tier and license info
+        tier = get_user_tier()
+        tier_label = "[bold green]Pro[/bold green]" if tier.value == "pro" else "[dim]Free[/dim]"
+
         console.print(Panel(
+            f"[bold]Tier:[/bold] {tier_label}\n"
             f"[bold]Cards in database:[/bold] {count}\n"
             f"[bold]Database path:[/bold] {db.db_path}\n"
             f"[bold]Last ingest:[/bold] {last_ingest or 'Never'}",
-            title="MTG Deck Engine — Database Info",
+            title="MTG Deck Engine — Status",
         ))
     finally:
         db.close()
+
+
+def cmd_license(args):
+    """Manage Pro license activation."""
+    from mtg_deck_engine.licensing import LICENSE_PATH, load_saved_license, remove_license, save_license
+
+    action = getattr(args, "license_action", None)
+
+    if action == "activate":
+        result = save_license(args.key)
+        if result.valid and result.grants_pro():
+            console.print(Panel(
+                f"[bold green]License activated successfully![/bold green]\n\n"
+                f"[bold]Email:[/bold] {result.email}\n"
+                f"[bold]Tier:[/bold] {result.tier}\n"
+                f"[bold]Expires:[/bold] {result.expires}\n\n"
+                f"[dim]Saved to {LICENSE_PATH}[/dim]",
+                title="MTG Deck Engine Pro",
+                border_style="green",
+            ))
+        else:
+            console.print(Panel(
+                f"[bold red]License activation failed[/bold red]\n\n"
+                f"[red]{result.error or 'Unknown error'}[/red]\n\n"
+                f"[dim]If you believe this is a mistake, contact support.[/dim]",
+                title="License Error",
+                border_style="red",
+            ))
+            sys.exit(1)
+
+    elif action == "show":
+        license = load_saved_license()
+        if license is None:
+            console.print(Panel(
+                "[dim]No license installed.[/dim]\n\n"
+                "Run [bold]mtg-engine license activate KEY[/bold] to activate Pro.",
+                title="License Status",
+            ))
+        elif license.valid and license.grants_pro():
+            status = "[bold green]ACTIVE[/bold green]"
+            if license.expires != "never":
+                from datetime import datetime
+                try:
+                    exp = datetime.fromisoformat(license.expires)
+                    if datetime.now() > exp:
+                        status = "[bold red]EXPIRED[/bold red]"
+                except ValueError:
+                    pass
+            console.print(Panel(
+                f"[bold]Status:[/bold] {status}\n"
+                f"[bold]Email:[/bold] {license.email}\n"
+                f"[bold]Tier:[/bold] {license.tier}\n"
+                f"[bold]Issued:[/bold] {license.issued}\n"
+                f"[bold]Expires:[/bold] {license.expires}\n"
+                f"[bold]ID:[/bold] {license.id}",
+                title="MTG Deck Engine Pro License",
+                border_style="green" if license.is_active() else "red",
+            ))
+        else:
+            console.print(Panel(
+                f"[red]License invalid: {license.error}[/red]",
+                title="License Error",
+                border_style="red",
+            ))
+
+    elif action == "remove":
+        if remove_license():
+            console.print("[yellow]License removed.[/yellow] You are now on the free tier.")
+        else:
+            console.print("[dim]No license to remove.[/dim]")
+
+    else:
+        console.print("Usage: mtg-engine license [activate KEY | show | remove]")
+        sys.exit(1)
 
 
 def cmd_probability(args):

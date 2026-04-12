@@ -10,6 +10,18 @@ Deck analysis, goldfish testing, matchup simulation, and player insight engine f
 - **Static Analysis**: Mana curve, color sources, role distribution, structural scoring, and actionable recommendations
 - **Format Validation**: Legality checks, copy limits, color identity, commander rules
 
+## Installation
+
+**Option 1: Desktop binary (Pro)** — Download the standalone Windows binary from the releases page. No Python install needed. Activate with your license key:
+```bash
+mtg-engine license activate YOUR_KEY
+```
+
+**Option 2: From source**
+```bash
+pip install -e .
+```
+
 ## Quick Start
 
 ```bash

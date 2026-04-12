@@ -34,6 +34,7 @@ FEATURE_TIERS: dict[str, Tier] = {
     "basic_recommendations": Tier.FREE,
     "info": Tier.FREE,
     "calc": Tier.FREE,
+    "license": Tier.FREE,
     # Pro features
     "deep_analysis": Tier.PRO,
     "probability": Tier.PRO,
@@ -54,6 +55,7 @@ COMMAND_FEATURES: dict[str, str] = {
     "search": "card_search",
     "info": "info",
     "calc": "calc",
+    "license": "license",  # Always free — managing your own license
     "probability": "probability",
     "goldfish": "goldfish_simulation",
     "gauntlet": "matchup_gauntlet",
@@ -75,7 +77,7 @@ _PRO_UPGRADE_MSG = (
 
 
 def get_user_tier() -> Tier:
-    """Detect the user's tier from environment or config."""
+    """Detect the user's tier from environment, license, or config."""
     # 1. Environment variable override
     env_tier = os.environ.get("MTG_ENGINE_TIER", "").lower().strip()
     if env_tier == "pro":
@@ -86,7 +88,16 @@ def get_user_tier() -> Tier:
         import sys
         print(f"Warning: unrecognized MTG_ENGINE_TIER='{env_tier}' (expected 'free' or 'pro')", file=sys.stderr)
 
-    # 2. Config file
+    # 2. Saved license file (Pro purchase)
+    try:
+        from mtg_deck_engine.licensing import load_saved_license
+        license = load_saved_license()
+        if license and license.grants_pro():
+            return Tier.PRO
+    except ImportError:
+        pass  # cryptography not installed
+
+    # 3. Config file
     if _CONFIG_PATH.exists():
         try:
             data = json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))
@@ -96,7 +107,7 @@ def get_user_tier() -> Tier:
         except (json.JSONDecodeError, OSError):
             pass
 
-    # 3. Default
+    # 4. Default
     return Tier.FREE
 
 
