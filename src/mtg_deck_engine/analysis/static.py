@@ -66,10 +66,11 @@ def analyze_deck(deck: Deck) -> AnalysisResult:
     for entry in active_entries:
         card = entry.card
         if card and not card.is_land:
-            mv = int(card.cmc)
+            cmc = card.display_cmc()
+            mv = int(cmc)
             capped = min(mv, 7)  # Group 7+ together
             mana_curve[capped] += entry.quantity
-            nonland_cmcs.extend([card.cmc] * entry.quantity)
+            nonland_cmcs.extend([cmc] * entry.quantity)
     result.mana_curve = dict(sorted(mana_curve.items()))
     result.average_cmc = round(sum(nonland_cmcs) / len(nonland_cmcs), 2) if nonland_cmcs else 0.0
 
@@ -350,7 +351,7 @@ def _generate_recommendations(
             e
             for e in deck.entries
             if e.card
-            and e.card.cmc >= 6
+            and e.card.display_cmc() >= 6
             and CardTag.FINISHER not in e.card.tags
             and e.zone == Zone.MAINBOARD
         ]

@@ -17,6 +17,12 @@ from mtg_deck_engine.probability.hypergeometric import cards_seen_by_turn, prob_
 _PIP_PATTERN = re.compile(r"\{([WUBRG])\}")
 _COLOR_NAMES = {"W": "White", "U": "Blue", "B": "Black", "R": "Red", "G": "Green"}
 
+# Deliberately narrow: castability asks "how often will this card be stuck in hand?"
+# Hybrid {W/U}, Phyrexian {W/P}, and twobrid {2/W} pips are all cast-any-side flexible —
+# counting them as strict demand would false-positive hybrid cards like Kitchen Finks as
+# unreliable. Strict castability = strict pip requirements only. For deck-wide pip
+# density (which wants a picture of total color pressure), see advanced.analyze_pips.
+
 
 @dataclass
 class CardCastability:

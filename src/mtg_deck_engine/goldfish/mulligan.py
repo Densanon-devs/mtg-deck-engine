@@ -78,7 +78,7 @@ def _bottom_cards(state: GameState, count: int):
                 keep_score += 30.0
 
         # Low-cost spells are more keepable
-        keep_score += max(0, 8 - card.cmc) * 5.0
+        keep_score += max(0, 8 - card.display_cmc()) * 5.0
 
         # Ramp is very keepable
         from mtg_deck_engine.models import CardTag

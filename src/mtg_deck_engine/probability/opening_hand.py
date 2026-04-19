@@ -75,11 +75,12 @@ def evaluate_hand(hand: list[DeckEntry], deck: Deck) -> HandEvaluation:
             if CardTag.TARGETED_REMOVAL in card.tags or CardTag.COUNTERSPELL in card.tags or CardTag.BOARD_WIPE in card.tags:
                 ev.interaction_count += 1
 
-        # Castability check (simplified: need lands >= CMC)
+        # Castability check (simplified: need lands >= CMC; split cards use front-face cost)
         if not card.is_land:
-            if card.cmc <= 2:
+            cmc = card.display_cmc()
+            if cmc <= 2:
                 ev.castable_by_turn_2 += 1
-            if card.cmc <= 3:
+            if cmc <= 3:
                 ev.castable_by_turn_3 += 1
 
     # Classify archetype
@@ -269,7 +270,7 @@ def _bottom_score(entry: DeckEntry) -> float:
         return -100.0
     if card.is_land:
         return 50.0
-    score = max(0, 8 - card.cmc) * 5.0
+    score = max(0, 8 - card.display_cmc()) * 5.0
     if card.tags and (CardTag.RAMP in card.tags or CardTag.MANA_ROCK in card.tags):
         score += 25.0
     if card.tags and CardTag.CARD_DRAW in card.tags:

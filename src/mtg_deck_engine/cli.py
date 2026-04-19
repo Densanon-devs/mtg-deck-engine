@@ -387,12 +387,17 @@ def cmd_analyze(args):
                     "synergies": [{"card_a": s.card_a, "card_b": s.card_b, "reason": s.reason} for s in adv.synergies],
                     "advanced_recommendations": adv.advanced_recommendations,
                 }
+                export_kwargs = {
+                    "power": power,
+                    "castability": castability,
+                    "staples": staples,
+                }
                 if export_path.suffix == ".json":
-                    export_json(result, adv_dict, archetype.value, export_path)
+                    export_json(result, adv_dict, archetype.value, export_path, **export_kwargs)
                 elif export_path.suffix == ".html":
-                    export_html(result, adv_dict, archetype.value, export_path)
+                    export_html(result, adv_dict, archetype.value, export_path, **export_kwargs)
                 else:
-                    export_markdown(result, adv_dict, archetype.value, export_path)
+                    export_markdown(result, adv_dict, archetype.value, export_path, **export_kwargs)
                 console.print(f"[green]Report exported to {export_path}[/green]")
 
     finally:

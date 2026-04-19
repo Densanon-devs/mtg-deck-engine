@@ -82,10 +82,10 @@ def _cast_spells(state: GameState):
     # Try to cast commander from command zone first (if affordable)
     _try_cast_commander(state)
 
-    # Gather castable nonland cards from hand
+    # Gather castable nonland cards from hand (split cards use front-face cost)
     castable = [
         e for e in state.hand
-        if e.card and not e.card.is_land and e.card.cmc <= state.mana_pool
+        if e.card and not e.card.is_land and e.card.display_cmc() <= state.mana_pool
     ]
 
     if not castable:
@@ -98,7 +98,7 @@ def _cast_spells(state: GameState):
     for entry in castable:
         if entry.card is None:
             continue
-        cost = int(entry.card.cmc)
+        cost = int(entry.card.display_cmc())
         if cost <= state.mana_pool:
             state.spend_mana(cost)
             state.cast_spell(entry)
@@ -169,12 +169,12 @@ def _spell_priority(entry: DeckEntry, state: GameState) -> float:
         score += 5.0  # Cast if nothing better, just for the body if any
 
     # Prefer spending all mana: bonus for cards that cost exactly remaining mana
-    cost = int(card.cmc)
+    cost = int(card.display_cmc())
     if cost == state.mana_pool:
         score += 10.0  # Perfect curve-out bonus
 
     # Slight bonus for higher CMC (bigger impact)
-    score += card.cmc * 1.5
+    score += card.display_cmc() * 1.5
 
     # Creatures get bonus for attacking
     if card.is_creature and card.power and card.power.isdigit():

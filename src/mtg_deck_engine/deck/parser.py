@@ -10,7 +10,11 @@ from mtg_deck_engine.models import DeckEntry, Zone
 # Regex patterns for decklist parsing
 # Matches: "1 Lightning Bolt", "1x Lightning Bolt", "Lightning Bolt"
 _QTY_NAME = re.compile(r"^\s*(\d+)\s*[xX]?\s+(.+?)\s*$")
-_NAME_ONLY = re.compile(r"^\s*([A-Za-z].+?)\s*$")
+# Name-only: anything non-empty that isn't a quantity-prefixed line. The ASCII-only [A-Za-z]
+# anchor used to live here but blocked Unicode card names like "Æther Vial" and
+# "Lim-Dûl's Vault" — exporters that preserve diacritics (some Moxfield exports) would
+# silently drop those rows.
+_NAME_ONLY = re.compile(r"^\s*(\S.*?)\s*$")
 
 # Section headers
 _SECTION_PATTERNS = {
@@ -75,8 +79,9 @@ def parse_decklist(text: str) -> list[DeckEntry]:
             custom_tags = tag_matches
             line = re.sub(r"\s*#\w+", "", line).strip()
 
-        # Strip set code and collector number: "(M21) 199", "(NEO)", etc.
-        line = re.sub(r"\s*\([A-Z0-9]+\)\s*\d*\s*$", "", line).strip()
+        # Strip set code and collector number: "(M21) 199", "(NEO)", "(neo)" — some exporters
+        # lowercase the set code, so accept either casing.
+        line = re.sub(r"\s*\([A-Za-z0-9]+\)\s*\d*\s*$", "", line).strip()
         # Strip trailing star for foil indicators
         line = re.sub(r"\s*\*F\*\s*$", "", line).strip()
 

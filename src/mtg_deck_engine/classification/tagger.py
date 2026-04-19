@@ -219,7 +219,7 @@ def _is_cantrip(card: Card) -> bool:
     ot = card.oracle_text.lower()
     if card.is_land or card.is_creature:
         return False
-    return "draw a card" in ot and card.cmc <= 2
+    return "draw a card" in ot and card.display_cmc() <= 2
 
 
 def _is_targeted_removal(card: Card) -> bool:

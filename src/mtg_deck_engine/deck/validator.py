@@ -311,10 +311,11 @@ def _check_commander(deck: Deck, issues: list[ValidationIssue]):
     for cmd in deck.commanders:
         if cmd.card is None:
             continue
-        type_line = cmd.card.type_line.lower()
+        # Split on em dash so a subtype token (e.g. "Illusion") can't leak into supertype/type flags.
+        types_part = cmd.card.type_line.split(" — ")[0].lower()
         oracle = cmd.card.oracle_text.lower()
-        is_legendary = "legendary" in type_line
-        is_creature = "creature" in type_line
+        is_legendary = "legendary" in types_part
+        is_creature = "creature" in types_part
         can_be_commander = "can be your commander" in oracle
 
         if not (is_legendary and is_creature) and not can_be_commander:

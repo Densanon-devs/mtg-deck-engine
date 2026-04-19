@@ -156,6 +156,18 @@ class Card(BaseModel):
     def has_type(self, t: str) -> bool:
         return t.lower() in self.type_line.lower()
 
+    def display_cmc(self) -> float:
+        """CMC used for curve bucketing and average-MV math.
+
+        Scryfall reports `cmc` as the SUM of both halves for split-layout cards
+        (e.g. Fire // Ice = 4), but the curve bucket players care about is the
+        cost of a single half. Transform / adventure / modal-DFC cards already
+        report the front face CMC at the top level, so only split needs fixing.
+        """
+        if self.layout == CardLayout.SPLIT and self.faces:
+            return self.faces[0].cmc or 0.0
+        return self.cmc or 0.0
+
     @property
     def image_url(self) -> str:
         """Scryfall hotlink URL. Never host card images locally."""

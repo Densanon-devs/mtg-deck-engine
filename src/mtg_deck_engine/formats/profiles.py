@@ -226,7 +226,7 @@ def detect_archetype(deck: Deck) -> DeckArchetype:
     if best_score < 3.0:
         # Fall back to generic detection by curve
         avg_cmc = sum(
-            e.card.cmc * e.quantity for e in active if e.card and not e.card.is_land
+            e.card.display_cmc() * e.quantity for e in active if e.card and not e.card.is_land
         ) / max(1, sum(e.quantity for e in active if e.card and not e.card.is_land))
 
         creature_count = sum(e.quantity for e in active if e.card and e.card.is_creature)
@@ -266,7 +266,7 @@ def format_recommendations(deck: Deck, archetype: DeckArchetype) -> list[str]:
         if tag_counts.get("threat", 0) < profile.targets.threats[0]:
             recs.append("Aggro decks need more threats — prioritize efficient creatures.")
         avg_cmc = sum(
-            e.card.cmc * e.quantity for e in active if e.card and not e.card.is_land
+            e.card.display_cmc() * e.quantity for e in active if e.card and not e.card.is_land
         ) / max(1, sum(e.quantity for e in active if e.card and not e.card.is_land))
         if avg_cmc > 2.5:
             recs.append("Aggro curve is too high — cut expensive spells for 1-2 drops.")

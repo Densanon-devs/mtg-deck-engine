@@ -68,7 +68,7 @@ def estimate_power_level(deck: Deck) -> PowerBreakdown:
     nonland_count = sum(e.quantity for e in nonlands)
 
     avg_cmc = (
-        sum(e.card.cmc * e.quantity for e in nonlands if e.card)
+        sum(e.card.display_cmc() * e.quantity for e in nonlands if e.card)
         / max(1, nonland_count)
     )
 
@@ -141,7 +141,7 @@ def estimate_power_level(deck: Deck) -> PowerBreakdown:
     # Low-CMC win conditions boost combo rating
     low_cmc_finishers = sum(
         e.quantity for e in active
-        if e.card and e.card.tags and CardTag.FINISHER in e.card.tags and e.card.cmc <= 4
+        if e.card and e.card.tags and CardTag.FINISHER in e.card.tags and e.card.display_cmc() <= 4
     )
     if low_cmc_finishers >= 3:
         combo_score += 2.0

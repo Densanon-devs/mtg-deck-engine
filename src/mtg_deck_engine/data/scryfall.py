@@ -108,7 +108,11 @@ def parse_scryfall_card(raw: dict) -> Card | None:
             pass
 
     type_line = raw.get("type_line", "")
-    tl_lower = type_line.lower()
+    # Scryfall type lines are "supertypes types — subtypes" (em dash U+2014). Subtype tokens
+    # can be arbitrary creature types — e.g. Mistform Island is "Creature — Illusion Island",
+    # which would false-positive on a naive `'land' in type_line`. Split on the em dash and
+    # match only against the pre-dash portion so subtype names can't leak into type flags.
+    types_part = type_line.split(" — ")[0].lower()
 
     return Card(
         scryfall_id=raw["id"],
@@ -130,14 +134,14 @@ def parse_scryfall_card(raw: dict) -> Card | None:
         loyalty=raw.get("loyalty"),
         rarity=raw.get("rarity", ""),
         set_code=raw.get("set", ""),
-        is_land="land" in tl_lower,
-        is_creature="creature" in tl_lower,
-        is_instant="instant" in tl_lower,
-        is_sorcery="sorcery" in tl_lower,
-        is_artifact="artifact" in tl_lower,
-        is_enchantment="enchantment" in tl_lower,
-        is_planeswalker="planeswalker" in tl_lower,
-        is_battle="battle" in tl_lower,
+        is_land="land" in types_part,
+        is_creature="creature" in types_part,
+        is_instant="instant" in types_part,
+        is_sorcery="sorcery" in types_part,
+        is_artifact="artifact" in types_part,
+        is_enchantment="enchantment" in types_part,
+        is_planeswalker="planeswalker" in types_part,
+        is_battle="battle" in types_part,
     )
 
 

@@ -5,6 +5,7 @@ Fetches public decklists via their APIs and converts to our format.
 
 from __future__ import annotations
 
+import asyncio
 import re
 
 import httpx
@@ -17,6 +18,56 @@ _ARCHIDEKT_PATTERN = re.compile(r"archidekt\.com/(?:decks|api/decks)/(\d+)")
 
 MOXFIELD_API = "https://api2.moxfield.com/v3/decks/all"  # Moxfield v3 public endpoint
 ARCHIDEKT_API = "https://archidekt.com/api/decks"
+
+# Retry policy for deck host APIs. Moxfield in particular rate-limits bulk
+# scripted imports (HTTP 429 with Retry-After); a single retry chain with
+# exponential backoff is cheap and lets a queued import keep progressing
+# rather than dying on the first throttle.
+_MAX_RETRIES = 3
+_INITIAL_BACKOFF_SECONDS = 1.0
+
+
+async def _get_with_backoff(client: httpx.AsyncClient, url: str, headers: dict) -> httpx.Response:
+    """GET `url`, retrying on 429 (and transient 5xx) with exponential backoff.
+
+    Honors the server's Retry-After header when present, otherwise doubles the
+    wait from _INITIAL_BACKOFF_SECONDS each attempt. Network / transport errors
+    get the same treatment. The final attempt re-raises whatever httpx surfaced.
+    """
+    delay = _INITIAL_BACKOFF_SECONDS
+    last_error: Exception | None = None
+    for attempt in range(_MAX_RETRIES):
+        try:
+            resp = await client.get(url, headers=headers)
+            if resp.status_code in (429, 502, 503, 504):
+                retry_after = resp.headers.get("Retry-After")
+                wait = float(retry_after) if retry_after and retry_after.isdigit() else delay
+                if attempt == _MAX_RETRIES - 1:
+                    resp.raise_for_status()
+                await asyncio.sleep(wait)
+                delay *= 2
+                continue
+            resp.raise_for_status()
+            return resp
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 429 and attempt < _MAX_RETRIES - 1:
+                retry_after = e.response.headers.get("Retry-After")
+                wait = float(retry_after) if retry_after and retry_after.isdigit() else delay
+                await asyncio.sleep(wait)
+                delay *= 2
+                last_error = e
+                continue
+            raise
+        except (httpx.TransportError, httpx.TimeoutException) as e:
+            last_error = e
+            if attempt == _MAX_RETRIES - 1:
+                raise
+            await asyncio.sleep(delay)
+            delay *= 2
+    # Unreachable under normal control flow — guard so callers never see None.
+    if last_error:
+        raise last_error
+    raise RuntimeError(f"Failed to fetch {url} after {_MAX_RETRIES} attempts")
 
 
 def detect_url(text: str) -> tuple[str, str] | None:
@@ -52,11 +103,10 @@ async def _fetch_moxfield(deck_id: str) -> list[DeckEntry]:
     """Fetch from Moxfield public API."""
     url = f"{MOXFIELD_API}/{deck_id}"
     async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.get(url, headers={
+        resp = await _get_with_backoff(client, url, headers={
             "Accept": "application/json",
             "User-Agent": "MTGDeckEngine/1.0",
         })
-        resp.raise_for_status()
         data = resp.json()
 
     entries: list[DeckEntry] = []
@@ -87,8 +137,7 @@ async def _fetch_archidekt(deck_id: str) -> list[DeckEntry]:
     """Fetch from Archidekt public API."""
     url = f"{ARCHIDEKT_API}/{deck_id}/"
     async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.get(url, headers={"Accept": "application/json"})
-        resp.raise_for_status()
+        resp = await _get_with_backoff(client, url, headers={"Accept": "application/json"})
         data = resp.json()
 
     entries: list[DeckEntry] = []

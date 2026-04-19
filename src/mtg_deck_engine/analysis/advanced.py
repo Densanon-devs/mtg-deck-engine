@@ -61,7 +61,25 @@ class AdvancedReport:
 # Pip analysis
 # =============================================================================
 
-_PIP_PATTERN = re.compile(r"\{([WUBRG])\}")
+_PIP_INNER_PATTERN = re.compile(r"\{([^}]+)\}")
+_WUBRG = {"W", "U", "B", "R", "G"}
+
+
+def _extract_pip_counts(mana_cost: str) -> Counter[str]:
+    """Count color demand per WUBRG color in a mana cost.
+
+    Handles pure pips {W}, hybrid {W/U} (adds to both halves), Phyrexian {W/P}
+    (adds to W, drops P), twobrid {2/W} (drops 2, adds to W), and colorless/{X}
+    (dropped). For hybrid, we overcount toward total deck pip demand — the card
+    could be cast with either half, but a mana base still wants to support both
+    options, so counting each half as a demand reflects that pressure.
+    """
+    counts: Counter[str] = Counter()
+    for inner in _PIP_INNER_PATTERN.findall(mana_cost):
+        for token in inner.split("/"):
+            if token in _WUBRG:
+                counts[token] += 1
+    return counts
 
 
 def analyze_pips(deck: Deck, color_sources: dict[str, int] | None = None) -> PipAnalysis:
@@ -83,8 +101,7 @@ def analyze_pips(deck: Deck, color_sources: dict[str, int] | None = None) -> Pip
             if card.faces:
                 mana_cost = card.faces[0].mana_cost
 
-        pips = _PIP_PATTERN.findall(mana_cost)
-        card_pip_count: Counter[str] = Counter(pips)
+        card_pip_count = _extract_pip_counts(mana_cost)
 
         for color, count in card_pip_count.items():
             pip_counter[color] += count * entry.quantity
