@@ -143,6 +143,7 @@ class Card(BaseModel):
     loyalty: Optional[str] = None
     rarity: str = ""
     set_code: str = ""
+    price_usd: Optional[float] = None  # USD market price from Scryfall; None = unknown
     is_land: bool = False
     is_creature: bool = False
     is_instant: bool = False

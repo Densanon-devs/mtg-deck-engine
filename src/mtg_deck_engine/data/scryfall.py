@@ -134,6 +134,7 @@ def parse_scryfall_card(raw: dict) -> Card | None:
         loyalty=raw.get("loyalty"),
         rarity=raw.get("rarity", ""),
         set_code=raw.get("set", ""),
+        price_usd=_parse_price(raw.get("prices", {})),
         is_land="land" in types_part,
         is_creature="creature" in types_part,
         is_instant="instant" in types_part,
@@ -143,6 +144,26 @@ def parse_scryfall_card(raw: dict) -> Card | None:
         is_planeswalker="planeswalker" in types_part,
         is_battle="battle" in types_part,
     )
+
+
+def _parse_price(prices: dict) -> float | None:
+    """Extract the USD market price from Scryfall's prices block.
+
+    Scryfall returns prices as strings (e.g. "1.25") or null. We prefer
+    paper `usd`, fall back to `usd_foil`, and return None if neither is
+    populated — null means "unknown" rather than "free" so the downstream
+    budget filter can treat NULL as "don't exclude" instead of "free card".
+    """
+    if not prices:
+        return None
+    for key in ("usd", "usd_foil", "usd_etched"):
+        val = prices.get(key)
+        if val:
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                continue
+    return None
 
 
 def load_bulk_file(path: Path) -> list[Card]:

@@ -78,6 +78,34 @@ def main():
         "--export", type=str, default=None,
         help="Export report to file (supports .json, .md, .html)",
     )
+    analyze_parser.add_argument(
+        "--with-llm", action="store_true",
+        help="Add LLM-generated executive summary + cut suggestions to the report (Pro)",
+    )
+    analyze_parser.add_argument(
+        "--llm-seed", type=int, default=42,
+        help=(
+            "RNG seed for the LLM backend. Same seed + same prompt = same "
+            "output (deterministic). Default: 42. Pass different integers "
+            "to get different angles on the same deck."
+        ),
+    )
+    analyze_parser.add_argument(
+        "--playgroup-power", type=_playgroup_power_type, default=None,
+        help="Target power level of your playgroup (1-10) — analyst narrates how the deck fits",
+    )
+    analyze_parser.add_argument(
+        "--vs-previous", action="store_true",
+        help="Narrate what changed vs. the last saved version of this deck (requires prior `save`)",
+    )
+    analyze_parser.add_argument(
+        "--deck-id", type=str, default=None,
+        help="Deck ID used during `save` (for --vs-previous lookup). Defaults to deck name, then falls back to a name-match over saved decks.",
+    )
+    analyze_parser.add_argument(
+        "--swaps", type=int, default=0, metavar="N",
+        help="Generate N paired cut+add swap suggestions (Pro; requires --with-llm)",
+    )
 
     # probability command
     prob_parser = subparsers.add_parser("probability", help="Run probability analysis on a decklist")
@@ -177,6 +205,31 @@ def main():
     info_parser = subparsers.add_parser("info", help="Show database info")
     info_parser.add_argument("--db", type=str, help="Custom database path")
 
+    # coach command (Pro) — interactive REPL with deck context pre-loaded
+    coach_parser = subparsers.add_parser(
+        "coach", help="Interactive deck coach (Pro) — asks questions about your deck")
+    coach_parser.add_argument("file", type=str, help="Path to decklist file")
+    coach_parser.add_argument("--name", type=str, default=None)
+    coach_parser.add_argument(
+        "--format", type=str, default=None, choices=[f.value for f in Format])
+    coach_parser.add_argument("--db", type=str, help="Custom database path")
+    coach_parser.add_argument(
+        "--llm-seed", type=int, default=42,
+        help="RNG seed for the coach LLM. Default: 42 (deterministic).",
+    )
+
+    # analyst command (Pro) — manage the local GGUF model for the LLM analyst layer
+    analyst_parser = subparsers.add_parser(
+        "analyst", help="Manage the local LLM analyst model (Pro)")
+    analyst_subs = analyst_parser.add_subparsers(dest="analyst_action")
+    analyst_pull = analyst_subs.add_parser("pull", help="Download an analyst model")
+    analyst_pull.add_argument(
+        "model", nargs="?", default="qwen2.5-3b",
+        choices=["qwen2.5-0.5b", "qwen2.5-3b"],
+        help="Which model to download (default: qwen2.5-3b, ~1.8 GB)",
+    )
+    analyst_subs.add_parser("show", help="Show the configured model path + availability")
+
     args = parser.parse_args()
 
     if args.command is None:
@@ -218,6 +271,10 @@ def main():
         cmd_info(args)
     elif command == "license":
         cmd_license(args)
+    elif command == "analyst":
+        cmd_analyst(args)
+    elif command == "coach":
+        cmd_coach(args)
 
 
 def _get_db(args) -> CardDatabase:
@@ -234,6 +291,25 @@ def cmd_ingest(args):
         asyncio.run(ingest(db=db, force=args.force))
     finally:
         db.close()
+
+
+def _playgroup_power_type(value: str) -> float:
+    """Validate the --playgroup-power arg to the 1.0-10.0 Commander power scale.
+
+    Users hitting values outside [1, 10] usually meant to type something on
+    that scale; rejecting early produces a clear error instead of weird
+    OVER/UNDER-PITCHES narration further down.
+    """
+    import argparse
+    try:
+        f = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"playgroup-power must be a number, got {value!r}")
+    if not (1.0 <= f <= 10.0):
+        raise argparse.ArgumentTypeError(
+            f"playgroup-power must be in 1.0-10.0 (Commander power scale); got {f}"
+        )
+    return f
 
 
 def cmd_analyze(args):
@@ -375,6 +451,38 @@ def cmd_analyze(args):
             else:
                 _run_and_render_probability(deck, args.sims)
 
+        # Analyst (LLM layer) [PRO]
+        analyst_output = None
+        if hasattr(args, "with_llm") and args.with_llm:
+            if require_pro("analyst"):
+                console.print("[yellow]--with-llm requires Pro tier.[/yellow] [dim]Set MTG_ENGINE_TIER=pro to unlock.[/dim]")
+            else:
+                version_diff = None
+                if getattr(args, "vs_previous", False):
+                    version_diff = _load_prev_version_diff(
+                        deck, result,
+                        deck_id_override=getattr(args, "deck_id", None),
+                    )
+                analyst_output = _run_analyst(
+                    deck, result, power, adv, archetype.value,
+                    seed=getattr(args, "llm_seed", 0),
+                    playgroup_power=getattr(args, "playgroup_power", None),
+                    version_diff=version_diff,
+                )
+                # Swaps are computed from the same analyst runner using the
+                # rule-engine ranker + candidate DB — no new LLM call.
+                swap_count = getattr(args, "swaps", 0) or 0
+                if swap_count > 0:
+                    from mtg_deck_engine.analyst import AnalystRunner
+                    swap_runner = AnalystRunner(backend=_default_mock_analyst_backend())
+                    analyst_output.swaps = swap_runner.run_swaps(
+                        deck=deck, analysis=result, power=power, advanced=adv,
+                        archetype=archetype.value, db=db,
+                        format_name=(deck.format.value if deck.format else "commander"),
+                        swap_count=swap_count,
+                    )
+                _render_analyst(analyst_output)
+
         # Export [PRO]
         if hasattr(args, "export") and args.export:
             if require_pro("export_reports"):
@@ -387,6 +495,16 @@ def cmd_analyze(args):
                     "synergies": [{"card_a": s.card_a, "card_b": s.card_b, "reason": s.reason} for s in adv.synergies],
                     "advanced_recommendations": adv.advanced_recommendations,
                 }
+                if analyst_output is not None:
+                    adv_dict["analyst_summary"] = analyst_output.summary
+                    adv_dict["analyst_cuts"] = [
+                        {
+                            "card": c.card_name,
+                            "reason": c.reason,
+                            "signals": c.signals,
+                        }
+                        for c in analyst_output.cuts
+                    ]
                 export_kwargs = {
                     "power": power,
                     "castability": castability,
@@ -1068,6 +1186,455 @@ def cmd_practice(args):
 
     finally:
         db.close()
+
+
+def cmd_coach(args):
+    """Interactive deck coach REPL.
+
+    Loads the deck, runs analysis + power-level + archetype detection, builds
+    a CoachSession seeded with a PIE-style knowledge sheet, then loops:
+    user types a question, the LLM answers using only the sheet's facts and
+    the allowlist of deck cards. Exit with /quit or EOF.
+
+    Pro-gated. Requires the analyst model to be installed (`mtg-engine analyst
+    pull qwen2.5-3b`) and MTG_ANALYST_BACKEND=llama_cpp in the env, otherwise
+    falls back to the placeholder mock backend (useful for smoke-testing but
+    not for real coaching).
+    """
+    from pathlib import Path
+
+    from mtg_deck_engine.analysis.power_level import estimate_power_level
+    from mtg_deck_engine.analysis.static import analyze_deck
+    from mtg_deck_engine.analyst.coach import CoachSession, build_deck_sheet, coach_step
+    from mtg_deck_engine.deck.parser import parse_auto
+    from mtg_deck_engine.deck.resolver import resolve_deck
+    from mtg_deck_engine.formats.profiles import detect_archetype
+
+    file_path = Path(args.file)
+    if not file_path.exists():
+        console.print(f"[red]File not found: {file_path}[/red]")
+        sys.exit(1)
+
+    db = _get_db(args)
+    try:
+        if db.card_count() == 0:
+            console.print("[red]No cards in database. Run 'mtg-engine ingest' first.[/red]")
+            sys.exit(1)
+
+        text = file_path.read_text(encoding="utf-8")
+        deck_name = args.name or file_path.stem
+        entries = parse_auto(text)
+        fmt = Format(args.format) if args.format else None
+        deck = resolve_deck(entries, db, name=deck_name, format=fmt)
+
+        # Compute the deck sheet inputs
+        result = analyze_deck(deck)
+        power = estimate_power_level(deck)
+        archetype = detect_archetype(deck)
+
+        color_identity = sorted({
+            c.value for e in deck.entries if e.card for c in e.card.color_identity
+        })
+        deck_cards = [e.card.name for e in deck.entries if e.card]
+        if not deck_cards:
+            console.print(
+                "[red]No valid cards resolved from the decklist.[/red] "
+                "[dim]Check that the file has real card names and the Scryfall "
+                "database is ingested (`mtg-engine ingest`).[/dim]"
+            )
+            sys.exit(1)
+
+        sheet = build_deck_sheet(
+            deck_name=deck.name,
+            archetype=archetype.value if hasattr(archetype, "value") else str(archetype),
+            color_identity=color_identity,
+            power_overall=power.overall,
+            power_tier=power.tier,
+            land_count=result.land_count,
+            ramp_count=result.ramp_count,
+            draw_count=result.draw_engine_count,
+            interaction_count=result.interaction_count,
+            avg_mana_value=result.average_cmc,
+            deck_cards=deck_cards,
+            reasons_up=list(power.reasons_up),
+            reasons_down=list(power.reasons_down),
+        )
+
+        session = CoachSession(deck_sheet=sheet, allowed_cards=set(deck_cards))
+
+        # Select a backend — mirror the analyst path
+        backend = _pick_analyst_backend(seed=getattr(args, "llm_seed", 0))
+
+        console.print(Panel(
+            f"[bold]Coach session loaded for {deck.name}[/bold]\n"
+            f"Power {power.overall:.1f}/10 ({power.tier}) — archetype: {archetype}\n\n"
+            f"[dim]Ask questions about your deck. Type /quit or Ctrl-D to exit.[/dim]",
+            border_style="cyan",
+        ))
+
+        while True:
+            try:
+                question = input("\nyou> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                console.print("\n[dim]session ended[/dim]")
+                break
+            if not question:
+                continue
+            if question.lower() in ("/quit", "/exit", "/q"):
+                console.print("[dim]session ended[/dim]")
+                break
+
+            turn = coach_step(session, backend, question, max_retries=1)
+            if turn.verified:
+                console.print(f"[cyan]coach[/cyan]> {turn.assistant_response}")
+            else:
+                console.print(
+                    "[yellow]coach[/yellow]> "
+                    "I couldn't generate a confident answer. Try rephrasing or "
+                    "asking about a specific axis (ramp, draw, interaction, curve)."
+                )
+    finally:
+        db.close()
+
+
+def _pick_analyst_backend(seed: int = 42):
+    """Shared backend selector used by `analyze --with-llm` and `coach`.
+
+    Reads MTG_ANALYST_BACKEND; falls back to mock when llama-cpp can't load.
+    Extracted so the coach and analyze paths stay in sync.
+    """
+    import os
+    backend_name = os.environ.get("MTG_ANALYST_BACKEND", "mock").lower().strip()
+    if backend_name in ("llama", "llama_cpp", "llamacpp"):
+        try:
+            from mtg_deck_engine.analyst.backends.llama_cpp import LlamaCppBackend
+            backend = LlamaCppBackend(seed=seed)
+            if not backend.is_available():
+                console.print(
+                    f"[yellow]Analyst model not found at {backend.model_path}; "
+                    "falling back to mock. Run `mtg-engine analyst pull` to install one.[/yellow]"
+                )
+                return _default_mock_analyst_backend()
+            return backend
+        except Exception as e:
+            console.print(f"[yellow]llama-cpp backend unavailable ({e}); falling back to mock.[/yellow]")
+            return _default_mock_analyst_backend()
+    return _default_mock_analyst_backend()
+
+
+def cmd_analyst(args):
+    """Manage the local GGUF model used by the LLM analyst layer.
+
+    Subcommands:
+      - pull [qwen2.5-0.5b | qwen2.5-3b]: download and install the model
+      - show: print the model path + whether it's currently available
+    """
+    from mtg_deck_engine.analyst.backends.llama_cpp import (
+        DEFAULT_MODEL_PATH, LlamaCppBackend,
+    )
+
+    action = getattr(args, "analyst_action", None)
+
+    if action == "show" or action is None:
+        backend = LlamaCppBackend()
+        status = "[green]ready[/green]" if backend.is_available() else "[yellow]not installed[/yellow]"
+        console.print(Panel(
+            f"[bold]Path:[/bold] {backend.model_path}\n"
+            f"[bold]Status:[/bold] {status}\n\n"
+            f"[dim]Run `mtg-engine analyst pull` to install the default model.[/dim]",
+            title="MTG Analyst Model",
+            border_style="cyan",
+        ))
+        return
+
+    if action == "pull":
+        model_key = getattr(args, "model", "qwen2.5-3b")
+        _pull_analyst_model(model_key)
+        return
+
+    console.print("[yellow]Unknown analyst action. Use `pull` or `show`.[/yellow]")
+
+
+# Hugging Face download URLs for the default GGUF models. Using bartowski's
+# GGUF repositories which serve a stable Q4_K_M quant at a consistent URL.
+_ANALYST_MODELS = {
+    "qwen2.5-0.5b": {
+        "url": "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf",
+        "size_mb": 400,
+        "filename": "qwen2.5-0.5b-instruct-q4_k_m.gguf",
+    },
+    "qwen2.5-3b": {
+        "url": "https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/qwen2.5-3b-instruct-q4_k_m.gguf",
+        "size_mb": 1800,
+        "filename": "qwen2.5-3b-instruct-q4_k_m.gguf",
+    },
+}
+
+
+def _pull_analyst_model(model_key: str):
+    """Download a model to ~/.mtg-deck-engine/models/ and symlink as analyst.gguf."""
+    from mtg_deck_engine.analyst.backends.llama_cpp import DEFAULT_MODEL_PATH
+    import shutil
+    import urllib.request
+
+    spec = _ANALYST_MODELS.get(model_key)
+    if spec is None:
+        console.print(f"[red]Unknown model: {model_key}[/red]")
+        return
+
+    dest_dir = DEFAULT_MODEL_PATH.parent
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest_file = dest_dir / spec["filename"]
+
+    if dest_file.exists():
+        console.print(f"[dim]Already downloaded: {dest_file}[/dim]")
+    else:
+        console.print(
+            f"[cyan]Downloading {model_key} (~{spec['size_mb']} MB) to {dest_file}...[/cyan]"
+        )
+        try:
+            # urlretrieve is simple; for nicer UX we could wire Rich Progress here.
+            urllib.request.urlretrieve(spec["url"], dest_file)
+        except Exception as e:
+            console.print(f"[red]Download failed: {e}[/red]")
+            if dest_file.exists():
+                dest_file.unlink()
+            return
+
+    # Point the default path at this download so LlamaCppBackend picks it up
+    # without the user setting MTG_ANALYST_MODEL.
+    if DEFAULT_MODEL_PATH != dest_file:
+        if DEFAULT_MODEL_PATH.exists() or DEFAULT_MODEL_PATH.is_symlink():
+            DEFAULT_MODEL_PATH.unlink()
+        try:
+            # Prefer a symlink on systems that allow it; fall back to a copy.
+            DEFAULT_MODEL_PATH.symlink_to(dest_file)
+        except (OSError, NotImplementedError):
+            shutil.copy2(dest_file, DEFAULT_MODEL_PATH)
+
+    console.print(f"[green]Analyst model installed at {DEFAULT_MODEL_PATH}[/green]")
+    console.print(
+        "[dim]Set MTG_ANALYST_BACKEND=llama_cpp to use it. "
+        "`mtg-engine analyze <deck> --with-llm` now emits LLM-backed summary + cuts.[/dim]"
+    )
+
+
+def _load_prev_version_diff(deck, result, deck_id_override: str | None = None) -> dict | None:
+    """Build a version-diff dict for the analyst prompt from the versions DB.
+
+    Lookup strategy (first hit wins):
+      1. If `deck_id_override` is given (from --deck-id), use it directly.
+         This matches the `save` subcommand's key exactly.
+      2. Otherwise, try `deck.name` as the deck_id — works when save was
+         invoked with `deck_id == deck_name`.
+      3. As a fallback, scan `store.list_decks()` for any saved deck whose
+         `name` field matches `deck.name` (case-insensitive). Handles the
+         common case where save used a different deck_id string but the
+         deck name is unique across the user's saved decks.
+
+    Returns None (with a warning) if nothing matches — the analyst then
+    renders without the version block.
+    """
+    try:
+        from mtg_deck_engine.versioning.storage import DeckSnapshot, VersionStore, diff_versions
+    except Exception:
+        return None
+    store = VersionStore()
+
+    prev = None
+    if deck_id_override:
+        prev = store.get_latest(deck_id_override)
+    if prev is None:
+        prev = store.get_latest(deck.name)
+    if prev is None:
+        # Fallback: name-match across saved decks. save uses deck_id as the
+        # primary key but stores deck.name separately, so we can still find
+        # the deck even if the user used a different deck_id.
+        try:
+            candidates = [
+                d for d in store.list_decks()
+                if (d.get("name") or "").lower() == deck.name.lower()
+            ]
+        except Exception:
+            candidates = []
+        if len(candidates) == 1:
+            prev = store.get_latest(candidates[0]["deck_id"])
+        elif len(candidates) > 1:
+            ids = ", ".join(c["deck_id"] for c in candidates[:3])
+            console.print(
+                f"[yellow]--vs-previous: multiple saved decks match name "
+                f"'{deck.name}' ({ids}). Pass --deck-id to disambiguate.[/yellow]"
+            )
+            return None
+
+    if prev is None:
+        console.print(
+            "[yellow]--vs-previous: no prior saved version for this deck; skipping.[/yellow] "
+            "[dim]Run `mtg-engine save <deck> <deck_id>` first, or pass --deck-id.[/dim]"
+        )
+        return None
+
+    # Build a transient snapshot for the current deck state so diff_versions
+    # can produce adds/removes/score-delta. We don't persist it; this is just
+    # for the diff math.
+    decklist: dict[str, int] = {}
+    zones: dict[str, list[str]] = {}
+    for entry in deck.entries:
+        name = entry.card_name
+        decklist[name] = decklist.get(name, 0) + entry.quantity
+        zone_key = entry.zone.value if hasattr(entry.zone, "value") else str(entry.zone)
+        zones.setdefault(zone_key, []).append(name)
+    current = DeckSnapshot(
+        deck_id=deck.name, version_number=0,
+        decklist=decklist, zones=zones,
+        scores=dict(result.scores or {}),
+    )
+    diff = diff_versions(prev, current)
+    return {
+        "added": dict(diff.added),
+        "removed": dict(diff.removed),
+        "score_deltas": dict(diff.score_deltas),
+    }
+
+
+def _run_analyst(
+    deck, result, power, adv, archetype_value: str,
+    seed: int = 42,
+    playgroup_power: float | None = None,
+    version_diff: dict | None = None,
+):
+    """Run the LLM analyst layer. Picks backend from MTG_ANALYST_BACKEND env var.
+
+    Supported values:
+      - "mock" (default): deterministic placeholder output. Used when no
+        GGUF model is present, for CI, and for gauntlet runs.
+      - "llama" / "llama_cpp": in-process llama-cpp-python with a local GGUF
+        at ~/.mtg-deck-engine/models/analyst.gguf (override via MTG_ANALYST_MODEL).
+
+    Args:
+      seed: Forwarded to LlamaCppBackend for reproducible generation. Same seed
+        + same prompt = same output. Useful for "show me the same advice again"
+        vs. bumping the seed to get a fresh take.
+      playgroup_power: Optional 1-10 power target for the user's playgroup.
+        Threads into the exec-summary prompt so the narration can frame the
+        deck's power relative to the table (e.g. "sits at 7, your table
+        targets 6 — this deck will over-pitch").
+    """
+    import os
+    backend_name = os.environ.get("MTG_ANALYST_BACKEND", "mock").lower().strip()
+    if backend_name in ("llama", "llama_cpp", "llamacpp"):
+        try:
+            from mtg_deck_engine.analyst.backends.llama_cpp import LlamaCppBackend
+            backend = LlamaCppBackend(seed=seed)
+            if not backend.is_available():
+                console.print(
+                    f"[yellow]Analyst model not found at {backend.model_path}; "
+                    "falling back to mock. Place a GGUF file at that path or "
+                    "set MTG_ANALYST_MODEL.[/yellow]"
+                )
+                backend = _default_mock_analyst_backend()
+        except Exception as e:
+            console.print(f"[yellow]llama-cpp backend unavailable ({e}); falling back to mock.[/yellow]")
+            backend = _default_mock_analyst_backend()
+    else:
+        backend = _default_mock_analyst_backend()
+
+    from mtg_deck_engine.analyst import AnalystRunner
+    runner = AnalystRunner(backend=backend)
+    return runner.run(
+        deck=deck, analysis=result, power=power, advanced=adv,
+        archetype=archetype_value, format_name=(deck.format.value if deck.format else "commander"),
+        playgroup_power=playgroup_power,
+        version_diff=version_diff,
+    )
+
+
+def _default_mock_analyst_backend():
+    """Mock backend emits structured placeholder text until PIE is wired.
+
+    Summary is deterministic prose; cuts reference c01/c02 — which are always
+    the highest-ranked candidates, so the verifier will pass (both tags are
+    in whatever candidate table the runner produced).
+    """
+    from mtg_deck_engine.analyst import MockBackend
+    return MockBackend(scripts=[
+        (
+            "[INPUT]",
+            (
+                "This deck's shape tracks its numbers — the land count, ramp "
+                "package, and curve are each within the commander target range, "
+                "so the engine is there. The rule-engine recommendations below "
+                "call out where the shape slips.\n\n"
+                "The biggest lever is the gap between the deck's threat density "
+                "and its interaction density. Bring interaction closer to the "
+                "target range and the deck should convert its stronger starts "
+                "into closed games more reliably."
+            ),
+        ),
+        (
+            "suggesting cuts",
+            "[c01]: flagged by the rule engine on redundancy and curve.\n"
+            "[c02]: weakest slot among the surfaced candidates.",
+        ),
+    ], default="")
+
+
+def _render_analyst(analyst_output):
+    """Render analyst output in the CLI.
+
+    Distinguishes three states for the cuts section so the user knows when
+    something genuinely went wrong vs. when the model simply didn't find
+    anything with enough confidence:
+      1. Cuts present -> normal happy path.
+      2. Verified + empty -> the ranker surfaced no candidates worth showing
+         (rare; only happens when the deck has no structural cut candidates).
+      3. Unverified -> the model tried, retries exhausted; show the low
+         confidence explicitly so the user isn't staring at a blank block.
+    """
+    from rich.panel import Panel
+
+    # Summary section
+    if analyst_output.summary_verified:
+        console.print(Panel(
+            analyst_output.summary,
+            title=f"Analyst Summary (confidence {analyst_output.summary_confidence:.0%})",
+            border_style="cyan",
+        ))
+    else:
+        console.print(
+            "[yellow]Analyst summary not confidently generated after retries — "
+            "skipping summary. The structured numeric analysis above is authoritative.[/yellow]"
+        )
+
+    # Cuts section
+    if analyst_output.cuts:
+        console.print(
+            f"\n[bold cyan]Analyst cut suggestions[/bold cyan] "
+            f"(confidence {analyst_output.cuts_confidence:.0%})"
+        )
+        for cut in analyst_output.cuts:
+            console.print(f"  [dim]- {cut.card_name}:[/dim] {cut.reason}")
+    elif analyst_output.raw_cuts and not analyst_output.cuts_verified:
+        console.print(
+            "\n[yellow]No high-confidence cut suggestions at this time.[/yellow] "
+            "[dim]The model tried but its output didn't pass verification "
+            "after 2 retries. Run with a larger model (MTG_ANALYST_MODEL) "
+            "or review the rule-engine recommendations above.[/dim]"
+        )
+    elif analyst_output.raw_cuts is None:
+        # Cuts weren't requested this run — say nothing.
+        pass
+
+    # Swap suggestions (paired cut + add at the same role)
+    if analyst_output.swaps:
+        console.print("\n[bold cyan]Analyst swap suggestions[/bold cyan]")
+        for s in analyst_output.swaps:
+            console.print(
+                f"  [dim]- cut[/dim] [red]{s.cut_card}[/red] "
+                f"[dim]-> add[/dim] [green]{s.add_card}[/green] "
+                f"[dim]({s.role})[/dim]"
+            )
+            console.print(f"    [dim]{s.rationale}[/dim]")
 
 
 def _run_and_render_probability(deck, sims: int = 10000, card_names: list[str] | None = None):

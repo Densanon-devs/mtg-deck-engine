@@ -46,6 +46,7 @@ FEATURE_TIERS: dict[str, Tier] = {
     "mulligan_practice": Tier.PRO,
     "advanced_scoring": Tier.PRO,
     "custom_benchmark_suites": Tier.PRO,
+    "analyst": Tier.PRO,  # LLM-backed analyst: executive summary + cut suggestions
 }
 
 # Map CLI command names to feature keys
@@ -64,6 +65,8 @@ COMMAND_FEATURES: dict[str, str] = {
     "history": "deck_version_history",
     "diff": "deck_diff",
     "practice": "mulligan_practice",
+    "analyst": "analyst",  # model-management subcommand — Pro-only
+    "coach": "analyst",    # interactive REPL — uses analyst backend, Pro-gated
 }
 
 _CONFIG_PATH = Path.home() / ".mtg-deck-engine" / "config.json"

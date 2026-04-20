@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS cards (
     loyalty TEXT,
     rarity TEXT DEFAULT '',
     set_code TEXT DEFAULT '',
+    price_usd REAL,
     data_json TEXT NOT NULL
 );
 
@@ -43,6 +44,37 @@ CREATE TABLE IF NOT EXISTS metadata (
     value TEXT NOT NULL
 );
 """
+
+# Lightweight migrations for schemas that pre-date a column. Run idempotently
+# on every connect — SQLite errors when ADD COLUMN hits an existing column
+# and when CREATE INDEX hits an existing index; we swallow both cases.
+# Order matters: ADD COLUMN must run before CREATE INDEX that references it.
+_MIGRATIONS = [
+    # price_usd added when Scryfall price integration shipped (phase 5)
+    "ALTER TABLE cards ADD COLUMN price_usd REAL",
+    "CREATE INDEX IF NOT EXISTS idx_cards_price ON cards(price_usd)",
+]
+
+
+def _apply_migrations(conn: sqlite3.Connection):
+    """Apply idempotent schema migrations on every connect.
+
+    ALTER TABLE ADD COLUMN and CREATE INDEX are both expected to fail with
+    `OperationalError` when the target already exists — that's the happy path
+    for migrations that have already run. We swallow *only* those expected
+    "already exists" / "duplicate column" errors so that unrelated failures
+    (locked database, permissions, corrupt schema) surface loudly instead of
+    leaving the schema half-migrated with silent downstream SQL errors.
+    """
+    expected_fragments = ("duplicate column", "already exists")
+    for stmt in _MIGRATIONS:
+        try:
+            conn.execute(stmt)
+        except sqlite3.OperationalError as e:
+            msg = str(e).lower()
+            if not any(frag in msg for frag in expected_fragments):
+                raise
+    conn.commit()
 
 
 class CardDatabase:
@@ -59,6 +91,7 @@ class CardDatabase:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.executescript(_SCHEMA)
+            _apply_migrations(self._conn)
         return self._conn
 
     def close(self):
@@ -93,8 +126,8 @@ class CardDatabase:
                    (scryfall_id, oracle_id, name, layout, cmc, mana_cost,
                     type_line, oracle_text, colors, color_identity, produced_mana,
                     keywords, legalities, faces, power, toughness, loyalty,
-                    rarity, set_code, data_json)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    rarity, set_code, price_usd, data_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 [_card_to_row(c) for c in batch],
             )
             conn.commit()
@@ -140,6 +173,10 @@ class CardDatabase:
 
 def _card_to_row(card: Card) -> tuple:
     data = card.model_dump(mode="json")
+    # Price sourced from the `prices.usd` field if present on the Card object
+    # (set by the Scryfall ingest). Falls back to None — the DB column is
+    # nullable and the filter treats NULL as "unknown price" (not excluded).
+    price_usd = getattr(card, "price_usd", None)
     return (
         card.scryfall_id,
         card.oracle_id,
@@ -160,6 +197,7 @@ def _card_to_row(card: Card) -> tuple:
         card.loyalty,
         card.rarity,
         card.set_code,
+        price_usd,
         json.dumps(data),
     )
 

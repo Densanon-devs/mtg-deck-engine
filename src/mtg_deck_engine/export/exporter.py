@@ -335,6 +335,19 @@ def export_markdown(
                 )
             lines.append("")
 
+    # Analyst (LLM layer) — optional summary + cut suggestions
+    if advanced and advanced.get("analyst_summary"):
+        lines.append("## Analyst Summary")
+        lines.append(advanced["analyst_summary"])
+        lines.append("")
+    if advanced and advanced.get("analyst_cuts"):
+        lines.append("## Analyst Cut Suggestions")
+        lines.append("| Card | Reason |")
+        lines.append("|------|--------|")
+        for cut in advanced["analyst_cuts"]:
+            lines.append(f"| {_md_cell(cut['card'])} | {_md_cell(cut['reason'])} |")
+        lines.append("")
+
     # Advanced
     if advanced:
         if advanced.get("mana_base_grade"):

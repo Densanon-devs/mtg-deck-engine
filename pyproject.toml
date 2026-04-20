@@ -23,6 +23,11 @@ dev = [
 desktop = [
     "pyinstaller>=6.0",
 ]
+analyst = [
+    # Local GGUF inference for the LLM analyst layer. Optional — the analyst
+    # falls back to MockBackend if this isn't installed.
+    "llama-cpp-python>=0.3",
+]
 
 [project.scripts]
 mtg-engine = "mtg_deck_engine.cli:main"
