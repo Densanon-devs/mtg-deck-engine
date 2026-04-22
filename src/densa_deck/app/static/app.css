@@ -620,6 +620,7 @@ body {
 
 .system-status .card.ready { border-left-color: var(--color-accent-green); }
 .system-status .card.missing { border-left-color: var(--color-warning); }
+.system-status .card.warning { border-left-color: #e8a33b; }
 
 /* -------- Toast -------- */
 .toast {

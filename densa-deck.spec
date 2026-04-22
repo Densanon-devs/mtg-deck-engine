@@ -11,7 +11,11 @@ Output:
 This spec uses folder mode by default for better performance.
 """
 
-from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.utils.hooks import (
+    collect_data_files,
+    collect_dynamic_libs,
+    collect_submodules,
+)
 
 # Collect all submodules of our package and key dependencies
 hidden_imports = (
@@ -22,18 +26,30 @@ hidden_imports = (
     # pywebview is optional but add it when present so the desktop app
     # ships inside the bundle without needing a separate install.
     + collect_submodules("webview", on_error="ignore")
+    # llama-cpp-python powers the optional analyst model. Lazy-imported
+    # inside densa_deck.analyst so PyInstaller's static analysis misses
+    # it — list explicitly.
+    + collect_submodules("llama_cpp", on_error="ignore")
 )
+
+# llama-cpp-python ships native DLLs (llama.dll, ggml-*.dll, mtmd.dll)
+# alongside the Python package. Without these, `import llama_cpp` fails
+# at runtime and the Settings panel shows "Analyst model not installed"
+# even when the GGUF file is present on disk.
+llama_binaries = collect_dynamic_libs("llama_cpp") if True else []
+llama_datas = collect_data_files("llama_cpp") if True else []
 
 a = Analysis(
     ["src/densa_deck/__main__.py"],
     pathex=["src"],
-    binaries=[],
+    binaries=llama_binaries,
     # Ship the desktop app's HTML/CSS/JS assets inside the bundle. Without
     # this PyInstaller strips the static/ dir and the frozen app launches
-    # with a blank window.
+    # with a blank window. llama_cpp's data files (metadata, etc.) come in
+    # via collect_data_files so the analyst model path resolves correctly.
     datas=[
         ("src/densa_deck/app/static/*", "densa_deck/app/static"),
-    ],
+    ] + llama_datas,
     hiddenimports=hidden_imports,
     hookspath=[],
     hooksconfig={},

@@ -99,6 +99,22 @@ class TestTierAndStatus:
         assert r["data"]["card_database"]["count"] == 0
         assert r["data"]["card_database"]["ready"] is False
 
+    def test_system_status_analyst_reports_file_and_library_separately(self, api):
+        """Regression for v0.1.1: after downloading the analyst GGUF, the
+        Settings card still said "Not installed" because is_available()
+        collapsed file-exists + library-importable into a single bool and
+        llama_cpp wasn't bundled in the frozen exe. v0.1.2 splits the
+        two checks so the UI can render a useful message in the mixed
+        state."""
+        r = api.get_system_status()
+        assert r["ok"] is True
+        am = r["data"]["analyst_model"]
+        assert "file_present" in am
+        assert "library_ok" in am
+        assert "reason" in am
+        # `ready` must require both pieces, not just one.
+        assert am["ready"] == (am["file_present"] and am["library_ok"])
+
 
 # ---------------------------------------------------------------- analyze
 

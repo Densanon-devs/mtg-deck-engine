@@ -656,11 +656,11 @@ async function refreshSettings() {
           ? `<span>${status.card_database.count.toLocaleString()} cards ingested</span>`
           : "<span>Not ingested yet. Click <strong>Install card database</strong> below.</span>"}
       </div>
-      <div class="card ${status.analyst_model.ready ? "ready" : "missing"}">
+      <div class="card ${status.analyst_model.ready ? "ready" : (status.analyst_model.file_present ? "warning" : "missing")}">
         <strong>Analyst model</strong><br>
         ${status.analyst_model.ready
           ? "<span>Ready</span>"
-          : "<span>Not installed. Click <strong>Download analyst model</strong> below.</span>"}
+          : `<span>${status.analyst_model.reason || "Not installed. Click <strong>Download analyst model</strong> below."}</span>`}
       </div>
     `;
   } catch (e) {

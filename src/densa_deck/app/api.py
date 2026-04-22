@@ -252,18 +252,34 @@ class AppApi:
         """
         db = self._get_db()
         card_count = db.card_count()
-        # Analyst model availability — keep import local so systems without
-        # the desktop extra still load this module.
+        # Analyst model availability is two separate questions:
+        #   1. Is the GGUF file downloaded to disk?
+        #   2. Is llama-cpp-python importable so we can actually use it?
+        # The UI cares about both — "file present but library missing"
+        # is a real state that earlier versions rendered as a misleading
+        # "Not installed" message after the user had just downloaded it.
+        analyst_path = ""
+        analyst_file_present = False
+        analyst_library_ok = False
+        analyst_reason = ""
         try:
-            from densa_deck.analyst.backends.llama_cpp import (
-                DEFAULT_MODEL_PATH, LlamaCppBackend,
-            )
-            backend = LlamaCppBackend()
-            analyst_available = backend.is_available()
+            from densa_deck.analyst.backends.llama_cpp import DEFAULT_MODEL_PATH
             analyst_path = str(DEFAULT_MODEL_PATH)
-        except Exception:
-            analyst_available = False
-            analyst_path = ""
+            analyst_file_present = DEFAULT_MODEL_PATH.exists()
+        except Exception as e:
+            analyst_reason = f"Could not resolve analyst model path: {e}"
+        if analyst_file_present:
+            try:
+                import llama_cpp  # noqa: F401
+                analyst_library_ok = True
+            except Exception as e:
+                analyst_reason = (
+                    f"Model file is present but llama-cpp-python failed to load "
+                    f"({e}). The analyst won't run until this is resolved — "
+                    f"reinstalling the app usually fixes it."
+                )
+        elif not analyst_reason:
+            analyst_reason = "Not installed. Click Download analyst model below."
         return {
             "card_database": {
                 "count": card_count,
@@ -271,7 +287,10 @@ class AppApi:
             },
             "analyst_model": {
                 "path": analyst_path,
-                "ready": analyst_available,
+                "ready": analyst_file_present and analyst_library_ok,
+                "file_present": analyst_file_present,
+                "library_ok": analyst_library_ok,
+                "reason": analyst_reason,
             },
             "version_db_path": str(self._get_vstore().db_path),
         }
