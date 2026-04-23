@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "densa-deck"
-version = "0.1.3"
+version = "0.1.4"
 description = "MTG deck analysis, goldfish testing, matchup simulation, and player insight engine"
 requires-python = ">=3.11"
 license = "MIT"

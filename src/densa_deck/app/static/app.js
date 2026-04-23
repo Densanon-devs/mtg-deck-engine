@@ -676,12 +676,17 @@ async function activateLicense() {
     const result = await callApi("activate_license", key);
     if (result.valid) {
       els.license_status.textContent = result.is_master ? "Master key activated." : "Pro activated.";
-      toast("License activated — restart the app if features don't update.", "success");
+      toast("License activated — Pro features are now available.", "success");
       state.tier = await callApi("get_tier");
       renderTier(state.tier);
       refreshSettings();
     } else {
-      els.license_status.textContent = "Invalid key — check that you copied it exactly.";
+      // Surface the granular error from verify_license_key (wrong prefix /
+      // wrong length / checksum mismatch / etc.) so the user can fix the
+      // specific part of the key that looks off, rather than hunting for
+      // typos blindly.
+      els.license_status.textContent = result.error
+        || "Invalid key — check that you copied it exactly.";
     }
   } catch (e) {
     els.license_status.textContent = "Activation failed: " + e.message;

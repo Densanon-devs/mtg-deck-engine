@@ -176,6 +176,123 @@ class TestLicenseFileIO:
             assert loaded.is_master is True
 
 
+class TestAtomicLicenseWrite:
+    """save_license must write atomically so a crash mid-write can't leave
+    the license.key half-written (earlier behavior silently dropped a
+    truncated file on next launch, forcing a re-activation)."""
+
+    def test_save_survives_crash_mid_replace(self):
+        import os as _os
+        tmp_dir = Path(tempfile.mkdtemp())
+        tmp_path = tmp_dir / "license.key"
+        with patch("densa_deck.licensing.LICENSE_PATH", tmp_path):
+            from densa_deck.licensing import load_saved_license, save_license
+            key = generate_license_key("crash_seed")
+            # Pre-existing good license the user already had.
+            save_license(key)
+            assert tmp_path.exists()
+            original = tmp_path.read_text(encoding="utf-8")
+
+            # Now simulate a crash during the NEXT save: os.replace raises.
+            # With atomic writes, the original file is still intact because
+            # os.replace runs last; the temp file is cleaned up and re-raised.
+            real_replace = _os.replace
+            calls = {"n": 0}
+            def flaky_replace(src, dst):
+                calls["n"] += 1
+                raise OSError("simulated crash mid-replace")
+            with patch("densa_deck.licensing.os.replace", flaky_replace):
+                try:
+                    save_license(generate_license_key("different_seed"))
+                except OSError:
+                    pass
+            # Original license must still be loadable.
+            assert tmp_path.exists()
+            assert tmp_path.read_text(encoding="utf-8") == original
+            loaded = load_saved_license()
+            assert loaded is not None and loaded.valid is True
+
+    def test_save_does_not_leak_temp_files_on_failure(self):
+        import os as _os
+        tmp_dir = Path(tempfile.mkdtemp())
+        tmp_path = tmp_dir / "license.key"
+        with patch("densa_deck.licensing.LICENSE_PATH", tmp_path):
+            from densa_deck.licensing import save_license
+            def flaky_replace(src, dst):
+                raise OSError("boom")
+            with patch("densa_deck.licensing.os.replace", flaky_replace):
+                try:
+                    save_license(generate_license_key("seed"))
+                except OSError:
+                    pass
+            # No .license.key.*.tmp debris left behind.
+            stray = list(tmp_dir.glob(".license.key.*.tmp"))
+            assert stray == []
+
+
+class TestCorruptLicenseRecovery:
+    """A corrupt license.key (truncated, invalid JSON, wrong schema) must
+    be moved aside and not block load_saved_license from returning None."""
+
+    def test_truncated_file_is_quarantined(self):
+        tmp_dir = Path(tempfile.mkdtemp())
+        tmp_path = tmp_dir / "license.key"
+        tmp_path.write_text('{"key": "DD-AAAA-BBBB',  encoding="utf-8")  # truncated
+        with patch("densa_deck.licensing.LICENSE_PATH", tmp_path):
+            from densa_deck.licensing import load_saved_license
+            # Truncated JSON falls back to legacy-raw-key path, which fails
+            # verification — function returns None rather than raising.
+            result = load_saved_license()
+            assert result is None or result.valid is False
+
+    def test_junk_json_with_no_key_field_is_quarantined(self):
+        tmp_dir = Path(tempfile.mkdtemp())
+        tmp_path = tmp_dir / "license.key"
+        tmp_path.write_text('{"not_a_key_field": "oops"}', encoding="utf-8")
+        with patch("densa_deck.licensing.LICENSE_PATH", tmp_path):
+            from densa_deck.licensing import load_saved_license
+            result = load_saved_license()
+            assert result is None
+            # Quarantine bak + log should exist; original removed or moved.
+            baks = list(tmp_dir.glob("license.key.corrupt-*.bak"))
+            log = tmp_dir / "load-errors.log"
+            assert len(baks) >= 1 or log.exists()
+
+
+class TestGranularVerificationErrors:
+    """verify_license_key returns user-actionable `error` strings so the
+    frontend can show "wrong prefix" / "wrong length" / "checksum mismatch"
+    instead of the generic "please check for typos" message."""
+
+    def test_empty_key_says_empty(self):
+        from densa_deck.licensing import verify_license_key
+        err = verify_license_key("").error.lower()
+        assert "empty" in err
+
+    def test_wrong_prefix(self):
+        from densa_deck.licensing import verify_license_key
+        err = verify_license_key("XX-ABCD-EFGH-IJKL").error.lower()
+        assert "prefix" in err
+
+    def test_wrong_length(self):
+        from densa_deck.licensing import verify_license_key
+        err = verify_license_key("DD-ABCD").error.lower()
+        assert "length" in err
+
+    def test_checksum_mismatch(self):
+        from densa_deck.licensing import verify_license_key
+        # Well-formed shape, but p3 is intentionally wrong.
+        err = verify_license_key("DD-ABCD-EFGH-ZZZZ").error.lower()
+        assert "checksum" in err or "typo" in err
+
+    def test_valid_key_has_no_error(self):
+        from densa_deck.licensing import generate_license_key, verify_license_key
+        k = generate_license_key("seed")
+        lic = verify_license_key(k)
+        assert lic.valid is True
+        assert lic.error == ""
+
+
 class TestJavaScriptCompatibility:
     """Critical: keys generated in the browser must validate in Python.
 

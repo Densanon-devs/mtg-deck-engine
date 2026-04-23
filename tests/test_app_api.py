@@ -820,8 +820,152 @@ class TestConcurrencyLocks:
         assert "error" not in results, results.get("error")
         assert results["count"] == 1
 
+    def test_progress_read_during_worker_update_never_raises(self, api):
+        """Regression lock for the audit finding: _do_ingest mutated
+        self._progress['ingest'] on a worker thread while ingest_progress
+        (UI polling) copied the dict on the main thread without a lock.
+        A rapid poll during mutation can raise RuntimeError("dictionary
+        changed size during iteration"). After the _update_progress /
+        _read_progress helper switch, both sides hold _progress_lock so
+        snapshots are always coherent."""
+        import threading, time
+        stop = threading.Event()
+        errors = []
 
-class TestErrorEnvelope:
+        def writer():
+            i = 0
+            while not stop.is_set():
+                api._update_progress("ingest", pct=i % 100, message=f"tick {i}")
+                i += 1
+                if i > 5000:
+                    break
+
+        def reader():
+            try:
+                while not stop.is_set():
+                    snap = api._read_progress("ingest")
+                    assert "pct" in snap
+            except Exception as e:
+                errors.append(repr(e))
+
+        t_w = threading.Thread(target=writer)
+        t_r = threading.Thread(target=reader)
+        t_w.start(); t_r.start()
+        time.sleep(0.3)
+        stop.set()
+        t_w.join(); t_r.join()
+        assert errors == [], errors
+
+    def test_close_joins_background_threads(self, api):
+        """Regression: AppApi.close() previously abandoned daemon threads,
+        which could yank SQLite mid-write. It now signals _shutdown_event
+        and joins each live thread with a bounded timeout, so a close()
+        during a quick no-op ingest lets it finish cleanly."""
+        import threading, time
+        # Register a fake "ingest" thread that takes ~0.2s to finish.
+        api._progress["ingest"].update(running=True, done=False)
+        finished = threading.Event()
+
+        def slow_worker():
+            # Mimic a worker that checks _shutdown_event at a checkpoint
+            # and exits early — the whole point of the event.
+            for _ in range(50):
+                if api._shutdown_event.is_set():
+                    break
+                time.sleep(0.01)
+            finished.set()
+
+        t = threading.Thread(target=slow_worker)
+        api._threads["fake-ingest"] = t
+        t.start()
+        t0 = time.time()
+        api.close()
+        elapsed = time.time() - t0
+        assert finished.is_set(), "worker did not finish — close() returned before signal was honored"
+        # close() joined with a 5s timeout — in practice the worker finishes
+        # in well under a second because it checks the shutdown event.
+        assert elapsed < 3.0
+
+    def test_coach_ask_and_reset_do_not_race(self, api_with_cards, monkeypatch):
+        """Regression for the audit finding: coach_ask released _coach_lock
+        before appending to session.history while coach_reset held the lock
+        and cleared the list. Under rapid interleaving, the list ended up
+        in a torn state. The per-session turn_lock now serializes any ask
+        with any reset on the same session."""
+        import threading, time, uuid
+        # Seed a session directly without going through coach_start (avoids
+        # needing a full deck + ingest fixture).
+        from densa_deck.analyst.coach import CoachSession
+        token = "test-token-" + uuid.uuid4().hex[:6]
+        session = CoachSession(deck_sheet="", allowed_cards=set())
+        api_with_cards._coach_sessions[token] = {
+            "session": session, "deck_name": "t", "deck_id": None,
+            "created_at": "", "turn_lock": threading.Lock(),
+        }
+
+        # Stub coach_step to append a turn with a small delay so the test
+        # window overlaps with coach_reset.
+        from densa_deck.analyst import coach as coach_mod
+        from densa_deck.analyst.coach import CoachTurn
+        def slow_step(sess, backend, question, max_retries=1):
+            time.sleep(0.02)
+            turn = CoachTurn(user_question=question, assistant_response="ok",
+                             verified=True, confidence=1.0)
+            sess.history.append(turn)
+            return turn
+        monkeypatch.setattr(coach_mod, "coach_step", slow_step)
+
+        errors = []
+        def asker():
+            for i in range(20):
+                r = api_with_cards.coach_ask(token, f"q{i}")
+                if not r.get("ok", True) and "closed" in (r.get("error", "") or "").lower():
+                    return
+                if r.get("ok") is False:
+                    errors.append(r)
+        def resetter():
+            for _ in range(20):
+                api_with_cards.coach_reset(token)
+                time.sleep(0.005)
+
+        ta = threading.Thread(target=asker)
+        tr = threading.Thread(target=resetter)
+        ta.start(); tr.start()
+        ta.join(); tr.join()
+
+        # Invariant: history must be a list of well-formed turns, never
+        # a partially-constructed state. (In Python, list.append is atomic
+        # under the GIL, but the test also asserts we never returned an
+        # error envelope from coach_ask due to a race-detection path.)
+        assert errors == [], errors
+        for turn in session.history:
+            assert turn.user_question.startswith("q")
+            assert turn.assistant_response == "ok"
+
+    def test_corrupt_coach_sessions_surfaces_load_warning(self, tmp_path):
+        """Regression: a corrupt coach_sessions.json should be quarantined
+        and surface a load_warning via get_system_status so the user is
+        told their history was moved aside rather than silently erased."""
+        from densa_deck.app.api import AppApi
+        session_path = tmp_path / "coach_sessions.json"
+        session_path.write_text("{not valid json", encoding="utf-8")
+        api = AppApi(
+            db_path=tmp_path / "cards.db",
+            session_path=session_path,
+            version_db_path=tmp_path / "versions.db",
+        )
+        status = api.get_system_status()
+        assert status["ok"] is True
+        warnings = status["data"]["load_warnings"]
+        assert any("Coach session" in w or "coach_session" in w.lower()
+                   for w in warnings), warnings
+        # Quarantine file should have been created beside the original
+        baks = list(tmp_path.glob("coach_sessions.json.corrupt-*.bak"))
+        assert len(baks) == 1
+        # Dismissing warnings empties the list
+        api.dismiss_load_warnings()
+        status2 = api.get_system_status()
+        assert status2["data"]["load_warnings"] == []
     def test_uncaught_exceptions_become_error_dicts(self, api):
         # Pass a bogus format that ValueError-s in Format(...) — the _safe
         # decorator should convert the exception to {ok: false, error: ...}

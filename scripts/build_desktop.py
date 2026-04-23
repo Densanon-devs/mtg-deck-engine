@@ -68,6 +68,39 @@ def verify():
         print(f"WARNING: Unexpected output: {result.stdout[:200]}")
         return False
 
+    # Smoke test the analyst runtime. This catches the class of bug that
+    # shipped in v0.1.1 / v0.1.2 / v0.1.3 where llama_cpp (or a transitive
+    # dep like numpy / jinja2 / diskcache / typing_extensions) was missing
+    # from the bundle and the analyst panel showed
+    # "Model file is present but llama-cpp-python failed to load (...)"
+    # after the user downloaded the GGUF.
+    #
+    # `densa-deck analyst show` prints "llama-cpp-python: importable" when
+    # the import succeeds in the frozen env, or "import failed: <reason>"
+    # otherwise.
+    print("Smoke-testing `analyst show` (verifies llama_cpp imports)...")
+    result = subprocess.run(
+        [str(binary), "analyst", "show"], capture_output=True, text=True, timeout=60,
+    )
+    if result.returncode != 0:
+        print(f"ERROR: `analyst show` failed: {result.stderr}")
+        return False
+    out = result.stdout
+    if "importable" in out.lower():
+        print("  llama-cpp-python: importable — analyst runtime OK.")
+    else:
+        print("ERROR: analyst runtime smoke test FAILED.")
+        print("  Expected `analyst show` to print 'llama-cpp-python: importable'.")
+        print("  Got:")
+        for line in out.splitlines():
+            print(f"    {line}")
+        print()
+        print("  This usually means llama_cpp or one of its deps (numpy,")
+        print("  jinja2, diskcache, typing_extensions, markupsafe) didn't")
+        print("  make it into the PyInstaller bundle. Check densa-deck.spec")
+        print("  hidden_imports + excludes.")
+        return False
+
     print("Binary verified successfully.")
     return True
 

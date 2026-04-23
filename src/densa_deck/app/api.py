@@ -109,6 +109,15 @@ class AppApi:
         self._progress_lock = threading.Lock()
         self._coach_lock = threading.Lock()
         self._backend_lock = threading.Lock()
+        # Signalled by close() so background workers (ingest, analyst pull)
+        # can notice an app shutdown and bail out early instead of leaving
+        # cards.db or the analyst.gguf in a half-written state.
+        self._shutdown_event = threading.Event()
+        # Warnings accumulated during __init__ so the frontend can surface
+        # "we couldn't read your coach_sessions.json last time — a fresh
+        # start was created" etc. on the Settings tab. Read via
+        # get_load_warnings() or as part of get_system_status().
+        self._load_warnings: list[str] = []
         # Persistence path for coach sessions — load on init so a user who
         # restarts the app finds their prior conversations intact.
         self._session_path = (
@@ -116,6 +125,11 @@ class AppApi:
             else Path.home() / ".densa-deck" / "coach_sessions.json"
         )
         self._load_coach_sessions()
+        # If a prior launch (or this one's license loader) quarantined a
+        # corrupt license.key, surface that so the user knows why they might
+        # need to re-activate — otherwise the Free tier just silently
+        # reappears and they're left wondering what happened.
+        self._check_license_quarantine()
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -132,7 +146,98 @@ class AppApi:
                 self._vstore = VersionStore()
         return self._vstore
 
+    # ------------------------------------------------------------------ background-op plumbing
+
+    def _update_progress(self, op: str, **fields) -> None:
+        """Apply a partial update to self._progress[op] under the lock.
+
+        Every background worker mutation MUST go through this helper (instead
+        of touching self._progress[op] directly) so concurrent poll reads from
+        the UI thread never see a torn dict or raise
+        RuntimeError("dictionary changed size during iteration").
+        """
+        with self._progress_lock:
+            self._progress[op].update(**fields)
+
+    def _read_progress(self, op: str) -> dict:
+        """Return a shallow copy of the progress dict under the lock.
+
+        Pairs with _update_progress — readers copy under the same lock that
+        writers hold when mutating, so the snapshot is always internally
+        consistent.
+        """
+        with self._progress_lock:
+            return dict(self._progress[op])
+
+    def _check_license_quarantine(self) -> None:
+        """Look for license.key.corrupt-*.bak files in the config dir and,
+        if any are present, add a one-time warning so the Settings panel
+        can tell the user their license needed re-activation and explain
+        how to recover (paste the DD-... key from the Stripe receipt).
+
+        The warning is self-clearing — once the user pastes a fresh key
+        and activates, the warning stays in _load_warnings until
+        dismiss_load_warnings() is called; the UI is expected to clear
+        it when the user acknowledges.
+        """
+        from densa_deck.licensing import LICENSE_PATH
+        try:
+            stale = list(LICENSE_PATH.parent.glob("license.key.corrupt-*.bak"))
+        except OSError:
+            return
+        if not stale:
+            return
+        self._load_warnings.append(
+            "A previous license.key was unreadable and was moved aside — "
+            "you may need to re-activate Pro by pasting your DD-XXXX-XXXX-XXXX "
+            "key from the Stripe receipt page. Old copies are preserved as "
+            "license.key.corrupt-*.bak in ~/.densa-deck/ for support."
+        )
+
+    def _quarantine_bad_file(self, path: Path, reason: str) -> None:
+        """Move a corrupt persistence file aside so future launches succeed
+        while still preserving the damaged original for support / forensics.
+
+        Best-effort: if the rename itself fails (permission denied, the file
+        just vanished, ...), we simply swallow the error — the loader calling
+        us has already decided to start fresh, and we shouldn't cascade a
+        failure here into blocking app launch.
+        """
+        from datetime import datetime as _dt
+        stamp = _dt.now().strftime("%Y%m%d-%H%M%S")
+        quarantine = path.with_suffix(path.suffix + f".corrupt-{stamp}.bak")
+        try:
+            path.rename(quarantine)
+        except OSError:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        # Append to a durable load-errors log so support can ask the user
+        # to send it if something weird keeps happening across launches.
+        try:
+            log_path = path.parent / "load-errors.log"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with log_path.open("a", encoding="utf-8") as fh:
+                fh.write(f"[{stamp}] quarantined {path.name}: {reason}\n")
+        except OSError:
+            pass
+
     def close(self):
+        # Signal background workers (ingest + analyst pull) to bail at the
+        # next checkpoint so we don't yank the DB / model file out from
+        # under an in-flight write.
+        self._shutdown_event.set()
+        # Best-effort join of any live background threads. Bounded to a
+        # generous-but-finite timeout so a stuck thread can't prevent the
+        # app from closing — the user's Alt-F4 still wins, we just get one
+        # honest chance to flush cleanly.
+        for name, t in list(self._threads.items()):
+            if t is not None and t.is_alive():
+                try:
+                    t.join(timeout=5.0)
+                except Exception:
+                    pass  # a hung thread isn't worth blocking close on
         # Persist coach sessions before tearing down the DB handles — the
         # versioning db path resolves to the same directory we save into, so
         # losing the vstore first would break `_session_path.parent` (the
@@ -194,15 +299,34 @@ class AppApi:
             print(f"Warning: couldn't persist coach sessions: {e}")
 
     def _load_coach_sessions(self):
-        """Restore sessions from the persistence file. Silent on a missing
-        or malformed file — a partial restore is worse than a fresh start."""
+        """Restore sessions from the persistence file.
+
+        On a missing file: stay silent. On a corrupt or malformed file:
+        rename it to coach_sessions.json.corrupt-<timestamp>.bak so the
+        user (or support) can forensics it later, record a warning the
+        UI can surface, and start with a fresh sessions dict. A partial
+        restore is worse than a fresh start but silently erasing history
+        with no breadcrumb is worse still.
+        """
         if not self._session_path.exists():
             return
         try:
-            payload = json.loads(self._session_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            raw = self._session_path.read_text(encoding="utf-8")
+            payload = json.loads(raw)
+        except (OSError, json.JSONDecodeError) as exc:
+            self._quarantine_bad_file(self._session_path, reason=str(exc))
+            self._load_warnings.append(
+                "Coach session history was unreadable last launch and a "
+                "fresh start was created. The old file is preserved as "
+                f"{self._session_path.name}.corrupt-*.bak if you need it."
+            )
             return
         if not isinstance(payload, list):
+            self._quarantine_bad_file(self._session_path, reason="payload is not a list")
+            self._load_warnings.append(
+                "Coach session file had an unexpected shape; fresh start created. "
+                f"Old copy preserved as {self._session_path.name}.corrupt-*.bak."
+            )
             return
 
         from densa_deck.analyst.coach import CoachSession, CoachTurn
@@ -229,6 +353,10 @@ class AppApi:
                 "deck_name": item.get("deck_name"),
                 "deck_id": item.get("deck_id"),
                 "created_at": item.get("created_at"),
+                # Per-session lock so coach_ask's append and coach_reset's
+                # clear / coach_close's pop can't race on session.history.
+                # See the long comment in coach_ask for the invariant.
+                "turn_lock": threading.Lock(),
             }
 
     # ------------------------------------------------------------------ status
@@ -293,7 +421,17 @@ class AppApi:
                 "reason": analyst_reason,
             },
             "version_db_path": str(self._get_vstore().db_path),
+            # Snapshot of warnings the frontend should surface as a
+            # dismissible banner in Settings — empty list is the happy path.
+            "load_warnings": list(self._load_warnings),
         }
+
+    @_safe
+    def dismiss_load_warnings(self) -> dict:
+        """Clear the pending load_warnings list. Called after the UI has
+        shown the banner and the user has acknowledged it."""
+        self._load_warnings.clear()
+        return {"cleared": True}
 
     # ------------------------------------------------------------------ analysis
 
@@ -746,6 +884,10 @@ class AppApi:
             self._coach_sessions[token] = {
                 "session": session, "deck_name": deck.name, "deck_id": deck_id,
                 "created_at": _now_iso(),
+                # Per-session turn_lock prevents coach_ask's history.append
+                # from racing with coach_reset's history.clear() or
+                # coach_close's pop. See comment in coach_ask.
+                "turn_lock": threading.Lock(),
             }
         return {
             "token": token,
@@ -761,9 +903,16 @@ class AppApi:
         """Send a question to an active coach session. Returns the turn
         (user_question, assistant_response, verified, confidence).
 
-        We look up the entry under the lock but run `coach_step` OUTSIDE it —
-        LLM generation can take seconds, and holding the lock that long would
-        block every other coach endpoint (list, close, etc.).
+        Two-layer locking avoids both "block all coach endpoints for the
+        seconds of LLM generation" (bad UX) and "history.append races
+        history.clear() from coach_reset" (data corruption):
+
+          1. _coach_lock — briefly held just to look up the entry.
+          2. entry["turn_lock"] — held across coach_step(), so this one
+             session serializes its turns while other sessions stay free.
+             coach_reset and coach_close also take this lock, so they
+             wait for an in-flight turn to finish instead of clobbering
+             session.history mid-append.
         """
         from densa_deck.analyst.coach import coach_step
         with self._coach_lock:
@@ -774,7 +923,14 @@ class AppApi:
             return {"ok": False, "error": "Question is empty."}
 
         backend = self._get_coach_backend()
-        turn = coach_step(entry["session"], backend, question, max_retries=1)
+        with entry["turn_lock"]:
+            # Re-check under the turn_lock so a concurrent coach_close that
+            # already popped the session doesn't see us appending to a
+            # detached session.history after the dict entry is gone.
+            with self._coach_lock:
+                if self._coach_sessions.get(token) is not entry:
+                    return {"ok": False, "error": f"Session was closed during generation: {token}"}
+            turn = coach_step(entry["session"], backend, question, max_retries=1)
         return {
             "user_question": turn.user_question,
             "assistant_response": turn.assistant_response,
@@ -784,19 +940,36 @@ class AppApi:
 
     @_safe
     def coach_reset(self, token: str) -> dict:
-        """Clear conversation history for a session but keep the deck sheet."""
+        """Clear conversation history for a session but keep the deck sheet.
+
+        Holds the session's turn_lock across the clear so an in-flight
+        coach_ask can't append a turn mid-clear. _coach_lock is only held
+        briefly to safely fetch the entry.
+        """
         with self._coach_lock:
             entry = self._coach_sessions.get(token)
-            if entry is None:
-                return {"ok": False, "error": "Unknown session."}
+        if entry is None:
+            return {"ok": False, "error": "Unknown session."}
+        with entry["turn_lock"]:
             entry["session"].history.clear()
         return {"reset": True}
 
     @_safe
     def coach_close(self, token: str) -> dict:
-        """Terminate a session and free its memory."""
+        """Terminate a session and free its memory.
+
+        Acquires the session's turn_lock before popping so any in-flight
+        coach_ask for this token finishes cleanly (or returns the
+        "closed during generation" error after re-checking). Without this,
+        close + in-flight ask could race on session.history.
+        """
         with self._coach_lock:
-            removed = self._coach_sessions.pop(token, None)
+            entry = self._coach_sessions.get(token)
+        if entry is None:
+            return {"closed": False}
+        with entry["turn_lock"]:
+            with self._coach_lock:
+                removed = self._coach_sessions.pop(token, None)
         return {"closed": removed is not None}
 
     @_safe
@@ -870,7 +1043,12 @@ class AppApi:
 
     @_safe
     def activate_license(self, key: str) -> dict:
-        """Activate a license key. Wraps licensing.save_license."""
+        """Activate a license key. Wraps licensing.save_license.
+
+        Returns the granular `error` string from verify_license_key on
+        failure so the UI can display "wrong prefix", "wrong length",
+        "checksum mismatch", etc. instead of a generic "invalid" message.
+        """
         from densa_deck.licensing import save_license
         result = save_license(key)
         return {
@@ -878,6 +1056,7 @@ class AppApi:
             "is_master": result.is_master,
             "key": result.key if result.valid else None,
             "activated_at": result.activated_at,
+            "error": result.error if not result.valid else "",
         }
 
     # ------------------------------------------------------------------ setup (threaded)
@@ -910,23 +1089,33 @@ class AppApi:
         """Poll target for the ingest progress bar. Fields: pct (0-100),
         message (human-readable phase), done (bool), error (nullable),
         running (bool)."""
-        return dict(self._progress["ingest"])
+        return self._read_progress("ingest")
 
     def _do_ingest(self, force: bool):
         """Background ingest. Runs the existing async pipeline via asyncio,
         updates `self._progress["ingest"]` at phase boundaries so the
         frontend's progress bar animates between phases (download → parse
         → store) rather than freezing on a single long bar.
+
+        All progress mutations go through self._update_progress so the UI
+        poller can't see a torn dict. At every phase boundary we check
+        self._shutdown_event so close()-during-ingest aborts cleanly
+        instead of trampling SQLite mid-write.
         """
         import asyncio
         try:
             # Phase 0: preamble
-            self._progress["ingest"].update(pct=1, message="Resolving Scryfall bulk URL...")
+            self._update_progress("ingest", pct=1, message="Resolving Scryfall bulk URL...")
+            if self._shutdown_event.is_set():
+                self._update_progress("ingest", message="Ingest cancelled (app closing)", done=True, running=False)
+                return
             db = self._get_db()
             existing = db.card_count()
             if existing > 0 and not force:
-                self._progress["ingest"].update(
-                    pct=100, message=f"Already ingested ({existing} cards). Pass force to re-download.",
+                self._update_progress(
+                    "ingest",
+                    pct=100,
+                    message=f"Already ingested ({existing} cards). Pass force to re-download.",
                     done=True, running=False,
                 )
                 return
@@ -943,21 +1132,28 @@ class AppApi:
             try:
                 # Phase 1: resolve the bulk-data URL (tiny HTTP call)
                 url = loop.run_until_complete(fetch_bulk_data_url())
-                self._progress["ingest"].update(pct=5, message="Downloading bulk card data (~250 MB)...")
+                if self._shutdown_event.is_set():
+                    self._update_progress("ingest", message="Ingest cancelled (app closing)", done=True, running=False)
+                    return
+                self._update_progress("ingest", pct=5, message="Downloading bulk card data (~250 MB)...")
 
                 # Phase 2: download (this is the big wait — hundreds of MB)
                 loop.run_until_complete(download_bulk_file(url, dest))
-                self._progress["ingest"].update(pct=60, message="Parsing cards...")
+                if self._shutdown_event.is_set():
+                    self._update_progress("ingest", message="Ingest cancelled (app closing)", done=True, running=False)
+                    return
+                self._update_progress("ingest", pct=60, message="Parsing cards...")
 
                 # Phase 3: parse
                 cards = load_bulk_file(dest)
-                self._progress["ingest"].update(pct=85, message=f"Storing {len(cards)} cards...")
+                self._update_progress("ingest", pct=85, message=f"Storing {len(cards)} cards...")
 
                 # Phase 4: write to SQLite
                 db.upsert_cards(cards)
                 db.set_metadata("last_ingest", str(len(cards)))
 
-                self._progress["ingest"].update(
+                self._update_progress(
+                    "ingest",
                     pct=100, message=f"Done — {len(cards)} cards stored.",
                     done=True, running=False,
                 )
@@ -965,7 +1161,8 @@ class AppApi:
                 loop.close()
                 dest.unlink(missing_ok=True)
         except Exception as e:
-            self._progress["ingest"].update(
+            self._update_progress(
+                "ingest",
                 error=str(e), message=f"Ingest failed: {e}",
                 done=True, running=False,
             )
@@ -989,12 +1186,17 @@ class AppApi:
 
     @_safe
     def analyst_pull_progress(self) -> dict:
-        return dict(self._progress["analyst_pull"])
+        return self._read_progress("analyst_pull")
 
     def _do_analyst_pull(self, model_key: str):
         """Background model download via urllib.request.urlretrieve with a
         reporthook callback that streams byte-count progress into the
-        progress dict."""
+        progress dict.
+
+        Progress mutations go through self._update_progress (locked); the
+        reporthook also checks self._shutdown_event and raises to abort the
+        download when the app is closing.
+        """
         import shutil
         import urllib.request
 
@@ -1006,7 +1208,8 @@ class AppApi:
 
             spec = _ANALYST_MODELS.get(model_key)
             if spec is None:
-                self._progress["analyst_pull"].update(
+                self._update_progress(
+                    "analyst_pull",
                     error=f"Unknown model: {model_key}", done=True, running=False,
                 )
                 return
@@ -1016,25 +1219,32 @@ class AppApi:
             dest_file = dest_dir / spec["filename"]
 
             if dest_file.exists():
-                self._progress["analyst_pull"].update(
+                self._update_progress(
+                    "analyst_pull",
                     pct=95, message="Already downloaded; wiring as default...",
                 )
             else:
                 total_bytes = [0]  # use list so nested fn can mutate
 
                 def _report(chunk_num: int, chunk_size: int, total_size: int):
+                    if self._shutdown_event.is_set():
+                        # urlretrieve's internal loop propagates exceptions
+                        # out of the reporthook, which aborts the download.
+                        raise RuntimeError("Pull cancelled (app closing)")
                     if total_size > 0:
                         downloaded = chunk_num * chunk_size
                         pct = min(95, int(downloaded / total_size * 95))
                         mb = downloaded // (1024 * 1024)
                         total_mb = total_size // (1024 * 1024)
-                        self._progress["analyst_pull"].update(
+                        self._update_progress(
+                            "analyst_pull",
                             pct=pct,
                             message=f"Downloading {model_key}: {mb}/{total_mb} MB",
                         )
                     total_bytes[0] = chunk_num * chunk_size
 
-                self._progress["analyst_pull"].update(
+                self._update_progress(
+                    "analyst_pull",
                     pct=1, message=f"Downloading {model_key} (~{spec['size_mb']} MB)...",
                 )
                 urllib.request.urlretrieve(spec["url"], dest_file, reporthook=_report)
@@ -1048,12 +1258,14 @@ class AppApi:
                 except (OSError, NotImplementedError):
                     shutil.copy2(dest_file, DEFAULT_MODEL_PATH)
 
-            self._progress["analyst_pull"].update(
+            self._update_progress(
+                "analyst_pull",
                 pct=100, message=f"Analyst model ready at {DEFAULT_MODEL_PATH}.",
                 done=True, running=False,
             )
         except Exception as e:
-            self._progress["analyst_pull"].update(
+            self._update_progress(
+                "analyst_pull",
                 error=str(e), message=f"Pull failed: {e}",
                 done=True, running=False,
             )

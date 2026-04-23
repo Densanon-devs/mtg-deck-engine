@@ -19,7 +19,9 @@ Master key bypasses all checks (developer access).
 from __future__ import annotations
 
 import json
+import os
 import re
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -134,24 +136,82 @@ def validate_key(key: str) -> bool:
 
 
 def verify_license_key(key: str) -> License:
-    """Parse and verify a license key. Returns License object."""
-    license = License(key=key.strip())
+    """Parse and verify a license key. Returns a License object whose
+    `error` field is a specific, user-actionable reason on failure:
 
-    if not key or not key.strip():
-        license.error = "Empty license key"
+      - "Empty license key" — nothing was pasted.
+      - "Wrong prefix — expected DD-XXXX-XXXX-XXXX (yours starts with ...)"
+      - "Wrong length — expected 16 characters (yours is N)"
+      - "Unexpected characters in the key — only A-Z and 0-9 allowed"
+      - "Checksum mismatch — typo in the last segment?"
+
+    The frontend shows this directly so users who pasted a stray space,
+    transposed a digit, or lost a character know exactly what to fix.
+    """
+    cleaned = (key or "").strip()
+    license = License(key=cleaned)
+
+    if not cleaned:
+        license.error = "Empty license key — paste the DD-XXXX-XXXX-XXXX value from your receipt."
         return license
 
-    if validate_key(key):
+    # Master key bypass — covered here so the granular error messages below
+    # don't accidentally reject it (its length / format is intentionally
+    # different from a real license).
+    if cleaned == MASTER_KEY:
         license.valid = True
-        license.is_master = (key.strip() == MASTER_KEY)
-    else:
-        license.error = "Invalid license key — please check for typos"
+        license.is_master = True
+        return license
 
+    upper = cleaned.upper()
+    match = _KEY_PATTERN.match(upper)
+    if match is None:
+        # Break down why the format check failed so the user can see which
+        # part of the key looks off.
+        if not upper.startswith("DD-"):
+            license.error = (
+                "Wrong prefix — expected a DD-XXXX-XXXX-XXXX key "
+                f"(yours starts with '{upper[:3]}')."
+            )
+        elif len(upper) != len("DD-XXXX-XXXX-XXXX"):
+            license.error = (
+                "Wrong length — expected 16 characters "
+                f"including the DD- prefix and dashes (yours is {len(upper)})."
+            )
+        elif not re.fullmatch(r"[A-Z0-9-]+", upper):
+            license.error = (
+                "Unexpected characters in the key — only letters and "
+                "digits are allowed between the dashes."
+            )
+        else:
+            license.error = (
+                "Dashes are in the wrong places — the key should look "
+                "like DD-XXXX-XXXX-XXXX with dashes after DD and every 4 characters."
+            )
+        return license
+
+    # Format is valid; recompute the checksum segment.
+    p1, p2, p3 = match.group(1), match.group(2), match.group(3)
+    check_hash = _hash_key(f"{p1}-{p2}")
+    expected_p3 = check_hash.ljust(4, "0")[:4].upper()
+    if p3 == expected_p3:
+        license.valid = True
+    else:
+        license.error = (
+            "Checksum doesn't match — the last 4 characters look like a "
+            "typo. Copy the full key from your Stripe receipt again or "
+            "email admin@densanon.com if you need help."
+        )
     return license
 
 
 def save_license(key: str) -> License:
-    """Validate and save a license key to the user's config directory."""
+    """Validate and save a license key to the user's config directory.
+
+    Writes atomically (temp file + os.replace) so a crash mid-write can't
+    truncate the license.key file and leave the user re-activating on
+    every restart.
+    """
     license = verify_license_key(key)
     if not license.valid:
         return license
@@ -161,30 +221,94 @@ def save_license(key: str) -> License:
         "key": key.strip(),
         "activated_at": datetime.now().isoformat(),
     }
-    LICENSE_PATH.write_text(json.dumps(data), encoding="utf-8")
+    payload = json.dumps(data)
+    # NamedTemporaryFile in the same directory so os.replace is atomic
+    # (cross-filesystem rename isn't guaranteed atomic on Windows).
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=".license.key.", suffix=".tmp", dir=str(LICENSE_PATH.parent),
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                # fsync can fail on some remote filesystems — not fatal
+                pass
+        os.replace(tmp_path, LICENSE_PATH)
+    except Exception:
+        # Clean up the temp file on any failure so we don't pollute the
+        # config dir with stale .license.key.*.tmp files.
+        try:
+            Path(tmp_path).unlink()
+        except OSError:
+            pass
+        raise
     license.activated_at = data["activated_at"]
     return license
 
 
 def load_saved_license() -> License | None:
-    """Load and verify the saved license, if any."""
+    """Load and verify the saved license, if any.
+
+    Returns None on "no license present" (missing file or empty file) and
+    also on I/O / parse errors — in the error case the damaged file is
+    moved aside to `license.key.corrupt-<timestamp>.bak` so a future save
+    can recreate cleanly, and a breadcrumb is left in
+    `~/.densa-deck/load-errors.log` for support diagnostics.
+    """
     if not LICENSE_PATH.exists():
         return None
     try:
         content = LICENSE_PATH.read_text(encoding="utf-8").strip()
-        if not content:
-            return None
-        # Try JSON first (new format), fall back to raw key (old format)
-        try:
-            data = json.loads(content)
-            key = data.get("key", "")
-            license = verify_license_key(key)
-            license.activated_at = data.get("activated_at", "")
-            return license
-        except json.JSONDecodeError:
-            return verify_license_key(content)
-    except OSError:
+    except OSError as exc:
+        _quarantine_license(reason=f"read failed: {exc}")
         return None
+    if not content:
+        return None
+    # Try JSON first (new format), fall back to raw key (old format).
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError:
+        # Treat as legacy raw-key format.
+        return verify_license_key(content)
+    key = data.get("key", "") if isinstance(data, dict) else ""
+    license = verify_license_key(key)
+    if not license.valid:
+        # The file parsed as JSON but didn't contain a usable key —
+        # quarantine so we don't keep tripping on it every launch.
+        _quarantine_license(reason="parsed license.key contained no valid key")
+        return None
+    license.activated_at = data.get("activated_at", "") if isinstance(data, dict) else ""
+    return license
+
+
+def _quarantine_license(reason: str) -> None:
+    """Move a bad license.key aside so the next save_license starts fresh.
+
+    Mirrors the quarantine pattern AppApi._quarantine_bad_file uses for
+    coach_sessions.json. Best-effort — a failure here must not block app
+    startup, so all filesystem calls are wrapped in try/except.
+    """
+    from datetime import datetime as _dt
+    stamp = _dt.now().strftime("%Y%m%d-%H%M%S")
+    try:
+        LICENSE_PATH.rename(LICENSE_PATH.with_suffix(
+            LICENSE_PATH.suffix + f".corrupt-{stamp}.bak"
+        ))
+    except OSError:
+        try:
+            LICENSE_PATH.unlink()
+        except OSError:
+            pass
+    try:
+        log_path = LICENSE_PATH.parent / "load-errors.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as fh:
+            fh.write(f"[{stamp}] quarantined license.key: {reason}\n")
+    except OSError:
+        pass
 
 
 def remove_license() -> bool:
