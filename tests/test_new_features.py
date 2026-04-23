@@ -207,6 +207,38 @@ class TestURLImport:
         assert result is not None
         assert result[0] == "moxfield"
 
+    def test_moxfield_cloudflare_403_becomes_actionable_error(self):
+        """Regression for the 403 users started seeing in April 2026:
+        Moxfield is now behind Cloudflare bot detection and all direct API
+        fetches from non-browser clients are refused. We intercept the
+        403 and raise a RuntimeError with instructions pointing the user
+        at Moxfield's Export->Text feature + the paste box instead."""
+        import asyncio
+        import httpx
+        from unittest.mock import AsyncMock, patch
+        from densa_deck.deck.url_import import _fetch_moxfield
+
+        # Build a fake 403 HTTPStatusError like httpx raises for cloudflare.
+        fake_resp = httpx.Response(
+            status_code=403, request=httpx.Request("GET", "https://api2.moxfield.com/v3/decks/all/x"),
+            content=b"<html>cloudflare</html>",
+        )
+        err = httpx.HTTPStatusError("403", request=fake_resp.request, response=fake_resp)
+
+        async def raising(*a, **kw):
+            raise err
+
+        with patch("densa_deck.deck.url_import._get_with_backoff", side_effect=raising):
+            try:
+                asyncio.get_event_loop().run_until_complete(_fetch_moxfield("deckid"))
+            except RuntimeError as e:
+                msg = str(e).lower()
+                assert "moxfield" in msg
+                assert "export" in msg and "text" in msg
+                assert "paste" in msg
+                return
+            raise AssertionError("expected a RuntimeError with user-actionable message")
+
 
 # --- Calc CLI ---
 

@@ -100,14 +100,33 @@ async def fetch_from_url(url: str) -> list[DeckEntry]:
 
 
 async def _fetch_moxfield(deck_id: str) -> list[DeckEntry]:
-    """Fetch from Moxfield public API."""
+    """Fetch from Moxfield public API.
+
+    As of April 2026, Moxfield sits behind Cloudflare bot detection that
+    blocks direct API requests from non-browser clients regardless of the
+    User-Agent we send — we translate a 403 to a user-actionable error
+    that directs people to Moxfield's "Export → Text" feature and the
+    paste-a-decklist box in the app, which always works.
+    """
     url = f"{MOXFIELD_API}/{deck_id}"
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await _get_with_backoff(client, url, headers={
-            "Accept": "application/json",
-            "User-Agent": "MTGDeckEngine/1.0",
-        })
-        data = resp.json()
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await _get_with_backoff(client, url, headers={
+                "Accept": "application/json",
+                "User-Agent": "DensaDeck/0.1 (+https://toolkit.densanon.com/densa-deck.html)",
+            })
+            data = resp.json()
+    except httpx.HTTPStatusError as e:
+        if e.response is not None and e.response.status_code == 403:
+            raise RuntimeError(
+                "Moxfield is blocking automated imports right now (their "
+                "Cloudflare gate rejects non-browser requests). To load "
+                "this deck into Densa Deck, open it on moxfield.com, click "
+                "Export \u2192 Text, copy the list, and paste it into the "
+                "decklist box above instead of using URL import. Archidekt "
+                "URLs also work as a direct import."
+            ) from e
+        raise
 
     entries: list[DeckEntry] = []
 
