@@ -44,6 +44,18 @@ CREATE TABLE IF NOT EXISTS metadata (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+-- card_aliases maps non-canonical names (Scryfall flavor_name for
+-- Universes Within reprints like Innistrad Crimson Vow's "Dracula, Blood
+-- Immortal" -> "Falkenrath Forebear") to the Oracle card's canonical name.
+-- Populated lazily by the resolver the first time a deck import hits an
+-- unresolved card; once cached, future imports resolve instantly with
+-- no network call.
+CREATE TABLE IF NOT EXISTS card_aliases (
+    alias_lower TEXT PRIMARY KEY,
+    oracle_name TEXT NOT NULL,
+    added_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
 """
 
 # Lightweight migrations for schemas that pre-date a column. Run idempotently
@@ -183,6 +195,32 @@ class CardDatabase:
             (f"%{query}%", limit),
         ).fetchall()
         return [_card_from_json(r[0]) for r in rows]
+
+    def lookup_alias(self, name: str) -> Card | None:
+        """Resolve a card via the card_aliases cache.
+
+        Used by the deck resolver as a second pass after the canonical-name
+        lookup misses. Populated by `add_alias` when the online Scryfall
+        fallback finds a flavor-name -> oracle-name mapping.
+        """
+        conn = self.connect()
+        row = conn.execute(
+            "SELECT oracle_name FROM card_aliases WHERE alias_lower = ? LIMIT 1",
+            (name.lower(),),
+        ).fetchone()
+        if not row:
+            return None
+        return self.lookup_by_name(row[0])
+
+    def add_alias(self, alias: str, oracle_name: str) -> None:
+        """Cache a flavor-name / alt-name -> oracle-name mapping so
+        future lookups resolve locally without hitting Scryfall."""
+        conn = self.connect()
+        conn.execute(
+            "INSERT OR REPLACE INTO card_aliases (alias_lower, oracle_name) VALUES (?, ?)",
+            (alias.lower(), oracle_name),
+        )
+        conn.commit()
 
 
 def _card_to_row(card: Card) -> tuple:
