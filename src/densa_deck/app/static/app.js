@@ -593,12 +593,31 @@ async function loadComboStatus() {
     const count = s.combo_count || 0;
     if (count === 0) {
       els.combo_status.innerHTML = `<div class="card missing"><strong>Combo cache</strong><br>Empty — click <strong>Refresh combo data</strong> below to populate (~30k combos, 30-60s download).</div>`;
-    } else {
-      const lastDate = s.last_refresh_at
-        ? escape(s.last_refresh_at.slice(0, 10))
-        : "never";
-      els.combo_status.innerHTML = `<div class="card ready"><strong>Combo cache</strong><br>${count.toLocaleString()} combos cached (last refresh ${lastDate})</div>`;
+      return;
     }
+    // Freshness check — Commander Spellbook adds variants weekly. Prompt
+    // a refresh after 30 days; warn at 90+ days.
+    let freshnessNote = "";
+    let cardClass = "ready";
+    if (s.last_refresh_at) {
+      try {
+        const refreshDate = new Date(s.last_refresh_at);
+        const daysAgo = (Date.now() - refreshDate.getTime()) / (1000 * 60 * 60 * 24);
+        if (daysAgo >= 90) {
+          freshnessNote = ` <span style="color:#ff9999;font-weight:600">(${Math.floor(daysAgo)} days old — refresh recommended)</span>`;
+          cardClass = "warning";
+        } else if (daysAgo >= 30) {
+          freshnessNote = ` <span style="color:#e8a33b">(${Math.floor(daysAgo)} days old)</span>`;
+          cardClass = "warning";
+        } else {
+          freshnessNote = ` <span class="status-text">(${Math.max(1, Math.floor(daysAgo))} day${Math.floor(daysAgo) === 1 ? "" : "s"} ago)</span>`;
+        }
+      } catch (e) { /* non-fatal — display without freshness note */ }
+    }
+    const lastDate = s.last_refresh_at
+      ? escape(s.last_refresh_at.slice(0, 10))
+      : "never";
+    els.combo_status.innerHTML = `<div class="card ${cardClass}"><strong>Combo cache</strong><br>${count.toLocaleString()} combos cached &middot; last refresh ${lastDate}${freshnessNote}</div>`;
   } catch (e) {
     // Non-fatal — combo cache check failure shouldn't block Settings.
   }
@@ -1204,13 +1223,48 @@ async function showDiff(vA, vB) {
       const cls = v >= 0 ? "diff-add" : "diff-remove";
       return `<li class="${cls}">${escape(n)} ${sign}${v.toFixed(1)}</li>`;
     }).join("") || "<li class='status-text'>(no changes)</li>";
+
+    // Combo gained / lost — only render when at least one is non-empty.
+    // Each row links to the upstream Spellbook page via open_external.
+    const comboGained = (d.combo_gained || []);
+    const comboLost = (d.combo_lost || []);
+    const comboSection = (comboGained.length || comboLost.length) ? `
+      <div class="diff-col" style="grid-column:1/-1">
+        <h4>Combos gained / lost</h4>
+        ${comboGained.length ? `
+          <strong class="diff-add">Newly complete (${comboGained.length}):</strong>
+          <ul>${comboGained.map(c =>
+            `<li class="diff-add">${escape(c.short_label)} <a href="#" class="external-link" data-url="${escape(c.spellbook_url)}">[?]</a></li>`,
+          ).join("")}</ul>` : ""}
+        ${comboLost.length ? `
+          <strong class="diff-remove">Now broken (${comboLost.length}):</strong>
+          <ul>${comboLost.map(c =>
+            `<li class="diff-remove">${escape(c.short_label)} <a href="#" class="external-link" data-url="${escape(c.spellbook_url)}">[?]</a></li>`,
+          ).join("")}</ul>` : ""}
+      </div>
+    ` : "";
+
     els.diff_panel.innerHTML = `
       <h4>Diff v${vA} → v${vB}</h4>
       <div class="diff-col"><h4>Added (${d.total_added})</h4><ul>${addedList}</ul></div>
       <div class="diff-col"><h4>Removed (${d.total_removed})</h4><ul>${removedList}</ul></div>
       <div class="diff-col"><h4>Score deltas</h4><ul>${scoreList}</ul></div>
+      ${comboSection}
     `;
     els.diff_panel.classList.remove("hidden");
+    // Wire combo external links inside the diff panel — they're inserted
+    // dynamically so the bootstrap-time .external-link delegation misses them.
+    els.diff_panel.querySelectorAll(".external-link").forEach(a => {
+      a.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        const url = a.dataset.url;
+        if (!url) return;
+        try {
+          if (window.pywebview?.api?.open_external) window.pywebview.api.open_external(url);
+          else window.open(url, "_blank");
+        } catch (err) { /* non-fatal */ }
+      });
+    });
   } catch (e) {
     toast("Diff failed: " + e.message, "error");
   }

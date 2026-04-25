@@ -1861,6 +1861,24 @@ code {
   line-height: 1.4;
 }
 
+/* Combo badge — small pill that appears on the Build tab deck title
+   when the current draft has detected combo lines. Click to scroll
+   to the combos panel. */
+.combo-badge {
+  display: inline-block;
+  background: linear-gradient(90deg, #c084fc, #818cf8);
+  color: #1a1d29;
+  font-size: 0.72rem;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 10px;
+  cursor: pointer;
+  user-select: none;
+}
+.combo-badge:hover {
+  filter: brightness(1.15);
+}
+
 /* Combo win-turn distribution bar — distinct shade from kill bars so
    "combo win turn" doesn't read as "damage-clock kill turn". */
 .kill-turn-dist .combo-fill {

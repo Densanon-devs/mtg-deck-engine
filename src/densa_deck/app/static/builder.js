@@ -624,6 +624,23 @@
     comboTimer = setTimeout(detectBuilderCombos, 600);
   }
 
+  function updateBuilderComboBadge(count) {
+    const badge = e("build-deck-combo-badge");
+    if (!badge) return;
+    if (!count) {
+      badge.classList.add("hidden");
+      return;
+    }
+    badge.textContent = `${count} combo${count === 1 ? "" : "s"}`;
+    badge.classList.remove("hidden");
+    // Scroll the combos block into view when the badge is clicked. Wired
+    // each render so the live badge value is correct on click.
+    badge.onclick = () => {
+      const block = e("builder-combos-block");
+      if (block) block.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    };
+  }
+
   async function detectBuilderCombos() {
     const body = e("builder-combos-body");
     if (!body) return;
@@ -631,6 +648,7 @@
     // Empty draft — show a hint and skip the call
     if (totalCardCount() === 0) {
       body.innerHTML = `<span class="panel-hint">Add cards to scan for combos.</span>`;
+      updateBuilderComboBadge(0);
       return;
     }
     try {
@@ -642,6 +660,7 @@
       );
       if (!r || r.match_count === 0) {
         body.innerHTML = `<span class="panel-hint">No combos detected.</span>`;
+        updateBuilderComboBadge(0);
         return;
       }
       const top = (r.combos || []).slice(0, 5).map(c => `
@@ -653,6 +672,7 @@
         <ul style="margin: 6px 0 0 20px; padding: 0; font-size: 0.78rem; line-height: 1.4;">${top}</ul>
         ${more}
       `;
+      updateBuilderComboBadge(r.match_count);
     } catch (err) {
       // ComboCacheEmpty / IngestRequired surface as errors — show
       // a helpful hint instead of an alarming red message.
@@ -664,6 +684,7 @@
       } else {
         body.innerHTML = `<span class="panel-hint">Combo detection unavailable.</span>`;
       }
+      updateBuilderComboBadge(0);
     }
   }
 

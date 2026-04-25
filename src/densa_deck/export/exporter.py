@@ -178,8 +178,19 @@ def export_markdown(
     staples: object | None = None,
     goldfish: object | None = None,
     gauntlet: object | None = None,
+    combos: list[dict] | None = None,
+    near_combos: list[dict] | None = None,
 ) -> str:
-    """Export analysis to Markdown."""
+    """Export analysis to Markdown.
+
+    `combos` (optional): list of {short_label, cards, produces, popularity,
+    spellbook_url, bracket_tag} dicts (output of `_combo_to_dict`). When
+    provided, a "Combos" section appears between Recommendations and the
+    Wizards-of-the-Coast attribution.
+
+    `near_combos` (optional): same shape but with `missing_cards`. When
+    provided, a "Combos you're 1 card away from" section is added.
+    """
     lines: list[str] = []
     lines.append(f"# {result.deck_name} — Deck Analysis Report")
     lines.append(f"*Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}*\n")
@@ -383,6 +394,39 @@ def export_markdown(
             lines.append(f"- {rec}")
         lines.append("")
 
+    # Combo lines section — surfaces the deck's combo plan if any combos
+    # were detected via the Commander Spellbook integration. Each entry
+    # links to the upstream combo page so readers can verify the
+    # mechanics. When near_combos are also provided, render them as a
+    # second sub-section (separately from the present-in-deck list).
+    if combos:
+        lines.append("## Combos")
+        lines.append("| Combo | Produces | Bracket | Popularity | Link |")
+        lines.append("|-------|----------|---------|------------|------|")
+        for c in combos:
+            label = _md_cell(c.get("short_label") or " + ".join(c.get("cards", [])))
+            produces = _md_cell(", ".join(c.get("produces") or []))
+            bracket = _md_cell(c.get("bracket_tag") or "")
+            pop = c.get("popularity") or 0
+            url = c.get("spellbook_url") or ""
+            link = f"[Spellbook]({url})" if url else ""
+            lines.append(f"| {label} | {produces} | {bracket} | {pop:,} | {link} |")
+        lines.append("")
+        lines.append("*Combo data via Commander Spellbook (MIT, © 2023 Commander-Spellbook).*")
+        lines.append("")
+    if near_combos:
+        lines.append("## Combos You're 1 Card Away From")
+        lines.append("| Combo | Missing | Popularity | Link |")
+        lines.append("|-------|---------|------------|------|")
+        for c in near_combos:
+            label = _md_cell(c.get("short_label") or " + ".join(c.get("cards", [])))
+            missing = _md_cell(", ".join(c.get("missing_cards") or []))
+            pop = c.get("popularity") or 0
+            url = c.get("spellbook_url") or ""
+            link = f"[Spellbook]({url})" if url else ""
+            lines.append(f"| {label} | {missing} | {pop:,} | {link} |")
+        lines.append("")
+
     lines.append("---")
     lines.append("*Card data provided by Scryfall. Not affiliated with Wizards of the Coast.*")
 
@@ -402,6 +446,8 @@ def export_html(
     staples: object | None = None,
     goldfish: object | None = None,
     gauntlet: object | None = None,
+    combos: list[dict] | None = None,
+    near_combos: list[dict] | None = None,
 ) -> str:
     """Export analysis to a self-contained HTML page."""
     # Generate markdown first, then wrap in HTML with styling
@@ -409,6 +455,7 @@ def export_html(
         result, advanced, archetype,
         power=power, castability=castability, staples=staples,
         goldfish=goldfish, gauntlet=gauntlet,
+        combos=combos, near_combos=near_combos,
     )
 
     # Convert basic markdown to HTML (simple conversion, no external deps)

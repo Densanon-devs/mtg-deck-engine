@@ -27,7 +27,12 @@ class CutCandidate:
     reasons: list[str]  # Machine-readable: "high_cmc", "no_functional_tag", "redundant_ramp"
 
 
-def rank_cut_candidates(deck: Deck, limit: int = 12) -> list[CutCandidate]:
+def rank_cut_candidates(
+    deck: Deck,
+    limit: int = 12,
+    *,
+    protected_card_names: set[str] | None = None,
+) -> list[CutCandidate]:
     """Rank deck cards by how cut-worthy they look from structural signals alone.
 
     Signals (higher = more cut-worthy):
@@ -37,9 +42,16 @@ def rank_cut_candidates(deck: Deck, limit: int = 12) -> list[CutCandidate]:
         highest-CMC ramp cards are surfaced as trim candidates
       - Not lands, not commander
 
+    `protected_card_names` (optional, lower-cased): cards that must NEVER
+    be surfaced as cut candidates. Used to shield combo pieces from
+    accidental cut suggestions — without this, the analyst would
+    cheerfully recommend cutting Thassa's Oracle from a Thoracle deck
+    because it's "high-CMC non-finisher".
+
     The LLM picks FROM this list. It cannot add cards not on the list because
     the prompt only shows these tags. Zero-hallucination surface for cuts.
     """
+    protected = protected_card_names or set()
     active = [
         e for e in deck.entries
         if e.zone == Zone.MAINBOARD and e.card is not None and not e.card.is_land
@@ -67,6 +79,10 @@ def rank_cut_candidates(deck: Deck, limit: int = 12) -> list[CutCandidate]:
     for entry in active:
         card = entry.card
         if card is None or card.name in seen_names:
+            continue
+        # Combo-piece protection: never suggest cutting a card that
+        # participates in a known combo line for this deck.
+        if protected and card.name.lower() in protected:
             continue
         tags = set(card.tags or [])
 

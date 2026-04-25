@@ -483,11 +483,62 @@ class AppApi:
         issues = validate_deck(deck)
         static_result.issues.extend(issues)
 
-        archetype = detect_archetype(deck)
-        power = estimate_power_level(deck)
+        # Combo detection — fed into archetype + power estimators so the
+        # downstream recommendations are combo-coherent. Skipped silently
+        # when the cache hasn't been refreshed yet.
+        detected_combo_count = 0
+        near_miss_combo_count = 0
+        try:
+            cstore = self._get_combo_store()
+            if cstore.combo_count() > 0:
+                from densa_deck.combos import detect_combos, detect_near_miss_combos
+                deck_card_names = [e.card.name for e in deck.entries if e.card]
+                deck_color_identity = sorted({
+                    c.value for e in deck.entries if e.card for c in e.card.color_identity
+                })
+                matches = detect_combos(
+                    store=cstore, deck_card_names=deck_card_names,
+                    deck_color_identity=deck_color_identity, limit=50,
+                )
+                detected_combo_count = len(matches)
+                near_miss_combo_count = len(detect_near_miss_combos(
+                    store=cstore, deck_card_names=deck_card_names,
+                    deck_color_identity=deck_color_identity, max_missing=1, limit=50,
+                ))
+        except Exception:
+            # Non-fatal — analyze_deck still returns its core fields.
+            pass
+
+        archetype = detect_archetype(deck, detected_combo_count=detected_combo_count)
+        power = estimate_power_level(
+            deck,
+            detected_combo_count=detected_combo_count,
+            near_miss_combo_count=near_miss_combo_count,
+        )
         advanced = run_advanced_analysis(deck, static_result.color_sources)
         castability = analyze_castability(deck, static_result.color_sources)
         staples = check_staples(deck)
+
+        # Combo-shaped recommendations appended after the rule engine —
+        # surface "X combo lines detected" / "no combos despite combo
+        # archetype" so users see the combo context inline with the rest
+        # of the analysis. Doesn't change the AnalysisResult schema; just
+        # extends the recommendations list.
+        if detected_combo_count > 0:
+            static_result.recommendations.append(
+                f"{detected_combo_count} combo line(s) detected — surfaced separately under "
+                f"Detected combos in the analysis output."
+            )
+        elif near_miss_combo_count >= 3:
+            static_result.recommendations.append(
+                f"{near_miss_combo_count} combos within 1 card of completion — "
+                f"see the near-miss panel to pick which one to lean into."
+            )
+        if str(getattr(archetype, "value", archetype)).lower() == "combo" and detected_combo_count == 0:
+            static_result.recommendations.append(
+                "Archetype reads as combo but no concrete combo lines were detected — "
+                "either refresh the combo cache (Settings → Combo data) or pivot the deck."
+            )
 
         unresolved = [e.card_name for e in deck.entries if e.card is None]
 

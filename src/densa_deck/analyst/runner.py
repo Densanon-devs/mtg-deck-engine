@@ -128,6 +128,7 @@ class AnalystRunner:
         playgroup_power: float | None = None,
         version_diff: dict | None = None,
         combo_lines: list[str] | None = None,
+        protected_card_names: set[str] | None = None,
     ) -> AnalystResult:
         """Run executive summary + cut suggestions + optional add suggestions.
 
@@ -144,6 +145,11 @@ class AnalystRunner:
         from `densa_deck.combos.detect_combos`. When provided, the
         summary prompt frames the deck as combo-shaped and mentions
         the win plan explicitly.
+
+        protected_card_names (optional, lower-cased): cards that are
+        excluded from the cut-candidate pool. Typically set to all
+        combo-piece names so the analyst doesn't recommend cutting
+        Thoracle from a Thoracle deck.
         """
         result = AnalystResult()
 
@@ -156,7 +162,10 @@ class AnalystRunner:
             )
 
         if want_cuts:
-            result = self._run_cuts(deck, archetype, power, cut_count, result)
+            result = self._run_cuts(
+                deck, archetype, power, cut_count, result,
+                protected_card_names=protected_card_names,
+            )
 
         if want_adds and db is not None:
             # Auto-detect role gaps from analysis vs commander targets
@@ -230,8 +239,11 @@ class AnalystRunner:
         power,
         cut_count: int,
         result: AnalystResult,
+        protected_card_names: set[str] | None = None,
     ) -> AnalystResult:
-        candidates = rank_cut_candidates(deck, limit=12)
+        candidates = rank_cut_candidates(
+            deck, limit=12, protected_card_names=protected_card_names,
+        )
         if not candidates:
             return result
 
@@ -301,6 +313,7 @@ class AnalystRunner:
         db,
         format_name: str = "commander",
         swap_count: int = 3,
+        protected_card_names: set[str] | None = None,
     ) -> list[SwapSuggestion]:
         """Generate swap suggestions (cut X, add Y at the same role).
 
@@ -344,7 +357,10 @@ class AnalystRunner:
         gaps = _detect_role_gaps(analysis)
         role_axes = [CardTag.RAMP, CardTag.CARD_DRAW, CardTag.TARGETED_REMOVAL, CardTag.BOARD_WIPE]
 
-        cut_cands = rank_cut_candidates(deck, limit=max(swap_count * 3, 8))
+        cut_cands = rank_cut_candidates(
+            deck, limit=max(swap_count * 3, 8),
+            protected_card_names=protected_card_names,
+        )
         swaps: list[SwapSuggestion] = []
         used_adds: set[str] = set()
 
