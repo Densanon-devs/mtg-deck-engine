@@ -48,6 +48,22 @@ hidden_imports = (
 llama_binaries = collect_dynamic_libs("llama_cpp") if True else []
 llama_datas = collect_data_files("llama_cpp") if True else []
 
+# Strip CUDA / cuBLAS DLLs from the llama_cpp binary set. The dev box
+# happens to have a CUDA-built wheel installed for local benchmarking,
+# which drags ~560 MB of cublasLt64_12.dll + cublas64_12.dll into the
+# bundle. Customers don't have a matching CUDA toolkit, so even if
+# those DLLs ship they wouldn't actually run on the customer's GPU —
+# llama_cpp's runtime probe falls back to CPU when CUDA load fails.
+# Releases historically shipped at ~50 MB binary; without this filter,
+# the bundle balloons by an order of magnitude for zero customer value.
+def _is_cuda_blob(entry):
+    name = entry[0].lower() if isinstance(entry, tuple) else str(entry).lower()
+    return any(tok in name for tok in (
+        "cublas", "cudart", "cudnn", "cufft", "curand", "cusolver",
+        "cusparse", "nvrtc", "nvjpeg", "nvjitlink",
+    ))
+llama_binaries = [b for b in llama_binaries if not _is_cuda_blob(b)]
+
 a = Analysis(
     ["src/densa_deck/__main__.py"],
     pathex=["src"],
@@ -76,9 +92,60 @@ a = Analysis(
         "test",
         "tests",
         "pytest",
+        # Dev-environment heavy deps that PyInstaller's static analysis
+        # drags in transitively even though densa_deck never imports
+        # them. On a dev box with ML tooling installed (torch, scipy,
+        # transformers, faiss, etc.) the unfiltered build balloons to
+        # ~1.3 GB; v0.1.6 was ~250 MB. Listing every one of these here
+        # keeps the bundle close to the historical size.
+        "torch",
+        "torchvision",
+        "torchaudio",
+        "scipy",
+        "scipy.libs",
+        "sklearn",
+        "transformers",
+        "tokenizers",
+        "faiss",
+        "faiss_cpu",
+        "django",
+        "psycopg2",
+        "psycopg2_binary",
+        "cryptography",
+        "Pythonwin",
+        "pythonwin",
+        "win32com",
+        "hf_xet",
+        "huggingface_hub",
+        "safetensors",
+        "sentence_transformers",
+        "accelerate",
+        "datasets",
+        "pyarrow",
+        "sympy",
     ],
     noarchive=False,
 )
+
+def _is_cuda_dll(entry):
+    """True for any binary whose dest-name is a CUDA / cuBLAS DLL.
+
+    PyInstaller's automatic PE-import walker adds these when llama_cpp's
+    .pyd files declare them as imports — even if we strip them from the
+    explicit `collect_dynamic_libs` list. The cublasLt64_12.dll alone is
+    467 MB. Customers don't have a matching CUDA toolkit installed, so
+    those DLLs would either fail to load or be unused; llama_cpp falls
+    back to CPU when CUDA isn't available. Stripping these entries from
+    a.binaries keeps the bundle close to the historical ~50 MB size.
+    """
+    name = entry[0].lower()
+    base = name.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    return any(tok in base for tok in (
+        "cublas", "cudart", "cudnn", "cufft", "curand", "cusolver",
+        "cusparse", "nvrtc", "nvjpeg", "nvjitlink",
+    ))
+
+a.binaries = [b for b in a.binaries if not _is_cuda_dll(b)]
 
 pyz = PYZ(a.pure)
 

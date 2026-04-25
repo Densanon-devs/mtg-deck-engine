@@ -59,13 +59,17 @@ def verify():
         return False
 
     print(f"Verifying binary at {binary}...")
-    result = subprocess.run([str(binary), "--help"], capture_output=True, text=True, timeout=30)
+    # Capture as bytes + decode with errors="replace" so Rich's box-drawing
+    # characters (which aren't representable in Windows' default cp1252)
+    # don't blow up subprocess's auto-decode and leave us with `out=None`.
+    result = subprocess.run([str(binary), "--help"], capture_output=True, timeout=30)
     if result.returncode != 0:
-        print(f"ERROR: Binary failed to run: {result.stderr}")
+        print(f"ERROR: Binary failed to run: {result.stderr.decode('utf-8', errors='replace')}")
         return False
+    help_out = result.stdout.decode("utf-8", errors="replace")
 
-    if "densa-deck" not in result.stdout.lower():
-        print(f"WARNING: Unexpected output: {result.stdout[:200]}")
+    if "densa-deck" not in help_out.lower():
+        print(f"WARNING: Unexpected output: {help_out[:200]}")
         return False
 
     # Smoke test the analyst runtime. This catches the class of bug that
@@ -80,12 +84,12 @@ def verify():
     # otherwise.
     print("Smoke-testing `analyst show` (verifies llama_cpp imports)...")
     result = subprocess.run(
-        [str(binary), "analyst", "show"], capture_output=True, text=True, timeout=60,
+        [str(binary), "analyst", "show"], capture_output=True, timeout=60,
     )
     if result.returncode != 0:
-        print(f"ERROR: `analyst show` failed: {result.stderr}")
+        print(f"ERROR: `analyst show` failed: {result.stderr.decode('utf-8', errors='replace')}")
         return False
-    out = result.stdout
+    out = result.stdout.decode("utf-8", errors="replace")
     if "importable" in out.lower():
         print("  llama-cpp-python: importable — analyst runtime OK.")
     else:
