@@ -17,8 +17,12 @@ import random
 from dataclasses import dataclass, field
 
 from densa_deck.classification.tagger import classify_card
+# Combo import goes through .models (not the package root) so we don't
+# pull in httpx — matchup module stays importable without network deps.
+from densa_deck.combos.models import Combo
 from densa_deck.goldfish.heuristics import play_turn
 from densa_deck.goldfish.mulligan import mulligan_phase
+from densa_deck.goldfish.runner import _possessed_card_names
 from densa_deck.goldfish.state import GameState
 from densa_deck.matchup.archetypes import ArchetypeProfile
 from densa_deck.models import Deck
@@ -29,7 +33,7 @@ class MatchupGameResult:
     """Result of a single matchup game."""
 
     won: bool = False
-    reason: str = ""           # "damage", "opponent_clock", "decked", "timeout"
+    reason: str = ""           # "damage", "combo", "opponent_clock", "decked", "timeout"
     turns_played: int = 0
     our_damage: int = 0
     opponent_damage: int = 0
@@ -39,6 +43,12 @@ class MatchupGameResult:
     spells_countered: int = 0
     wipes_suffered: int = 0
     commander_cast_turn: int | None = None
+    # Combo-aware tracking (populated when simulate_matchup is called
+    # with `combos`). combo_win_turn = first turn where every card of
+    # any tracked combo is in possession; reason="combo" when this turn
+    # was THE deciding factor (i.e. it fired before damage closed).
+    combo_win_turn: int | None = None
+    combo_id_fired: str | None = None
 
 
 @dataclass
@@ -61,8 +71,16 @@ class MatchupResult:
 
     # Win condition breakdown
     wins_by_damage: int = 0
+    wins_by_combo: int = 0           # combo assembled before opponent closed
     losses_by_clock: int = 0
     losses_by_timeout: int = 0
+
+    # Combo metrics — empty / zero when simulate_matchup was called
+    # without combos.
+    combos_evaluated: int = 0
+    combo_win_rate: float = 0.0       # share of wins via combo (of all sims)
+    avg_combo_win_turn: float = 0.0
+    top_combo_lines: list[tuple[str, str, int, float]] = field(default_factory=list)
 
     game_results: list[MatchupGameResult] = field(default_factory=list)
 
@@ -74,8 +92,18 @@ def simulate_matchup(
     max_turns: int = 12,
     seed: int | None = None,
     store_games: bool = False,
+    combos: list[Combo] | None = None,
 ) -> MatchupResult:
-    """Simulate a deck against an archetype opponent."""
+    """Simulate a deck against an archetype opponent.
+
+    When `combos` is non-empty, each game also tracks the earliest
+    turn at which all pieces of any combo are in possession
+    (battlefield + hand + graveyard). If the combo assembles BEFORE
+    the opponent closes the clock, the win is attributed to the combo
+    line — `wins_by_combo` increments and the game's reason is
+    'combo'. This lets matchup results capture combo decks whose
+    damage clock alone would never reach lethal (Thoracle-style wins).
+    """
     if seed is not None:
         random.seed(seed)
 
@@ -87,14 +115,29 @@ def simulate_matchup(
     is_commander = deck.format and deck.format.value in ("commander", "brawl", "oathbreaker", "duel")
     starting_life = 40 if is_commander else 20
 
+    # Pre-filter combos to those whose pieces all appear in this deck —
+    # nothing else can possibly fire. Same idea as run_goldfish_batch
+    # so the per-turn check is bounded.
+    deck_card_names = {e.card.name for e in deck.entries if e.card}
+    relevant_combos: list[Combo] = []
+    if combos:
+        for c in combos:
+            if c.cards and all(name in deck_card_names for name in c.cards):
+                relevant_combos.append(c)
+
     games: list[MatchupGameResult] = []
 
     for _ in range(simulations):
-        result = _run_matchup_game(deck, opponent, max_turns, starting_life)
+        result = _run_matchup_game(
+            deck, opponent, max_turns, starting_life, relevant_combos,
+        )
         games.append(result)
 
     # Aggregate
-    return _aggregate_matchup(games, opponent.display_name, simulations, store_games)
+    matchup = _aggregate_matchup(games, opponent.display_name, simulations, store_games)
+    matchup.combos_evaluated = len(relevant_combos)
+    _aggregate_matchup_combos(matchup, games, simulations, relevant_combos)
+    return matchup
 
 
 def _run_matchup_game(
@@ -102,8 +145,21 @@ def _run_matchup_game(
     opp: ArchetypeProfile,
     max_turns: int,
     starting_life: int,
+    combos: list[Combo] | None = None,
 ) -> MatchupGameResult:
-    """Run a single game against an archetype."""
+    """Run a single game against an archetype.
+
+    Combo handling: if `combos` is non-empty, the per-turn end-step
+    check looks for any combo whose pieces are all currently in the
+    player's possession (battlefield + hand + graveyard). The first
+    turn this is true marks combo_win_turn. Whether the combo "wins"
+    the game depends on whether the opponent closes their clock first —
+    if combo_win_turn lands on or before this turn AND the opponent
+    hasn't reduced our life to 0, we attribute the win to the combo
+    (reason='combo'). Damage-closes still take precedence when they
+    happen first because the simulator checks opponent_life <= 0
+    earlier in the same turn.
+    """
     state = GameState()
     state.life = starting_life
     state.opponent_life = starting_life
@@ -116,6 +172,12 @@ def _run_matchup_game(
     spells_countered = 0
     wipes_suffered = 0
     opponent_damage_dealt = 0
+
+    combo_index: list[tuple[Combo, frozenset[str]]] = []
+    if combos:
+        combo_index = [(c, frozenset(name.lower() for name in c.cards)) for c in combos]
+    combo_win_turn: int | None = None
+    combo_id_fired: str | None = None
 
     for _ in range(max_turns):
         state.begin_turn()
@@ -194,10 +256,33 @@ def _run_matchup_game(
             state.life -= actual_damage
             opponent_damage_dealt += actual_damage
 
+        # --- Combo assembly check ---
+        # Run before life-loss checks so that on a turn where both the
+        # combo assembles AND the opponent's clock reaches 0 simultaneously,
+        # the combo win takes precedence (matches the spirit of "I had
+        # lethal on the stack first"). Damage-by-our-side still wins out
+        # because that check is above this block.
+        if combo_index and combo_win_turn is None:
+            possessed = _possessed_card_names(state)
+            for combo, combo_set in combo_index:
+                if combo_set.issubset(possessed):
+                    combo_win_turn = state.turn
+                    combo_id_fired = combo.combo_id
+                    break
+
         # --- Check game end ---
         if state.opponent_life <= 0:
             result.won = True
             result.reason = "damage"
+            break
+        # Combo win — only if it would close BEFORE the opponent's clock
+        # reaches us. We check life >= 1 to ensure the combo didn't fire
+        # on the same turn the opponent killed us; a tied turn goes to
+        # the opponent because their damage step happened earlier in this
+        # loop iteration.
+        if combo_win_turn is not None and state.life > 0:
+            result.won = True
+            result.reason = "combo"
             break
         if state.life <= 0:
             result.won = False
@@ -220,6 +305,8 @@ def _run_matchup_game(
     result.spells_countered = spells_countered
     result.wipes_suffered = wipes_suffered
     result.commander_cast_turn = state.commander_cast_turn
+    result.combo_win_turn = combo_win_turn
+    result.combo_id_fired = combo_id_fired
 
     return result
 
@@ -251,6 +338,7 @@ def _aggregate_matchup(
     result.avg_wipes_suffered = round(sum(g.wipes_suffered for g in games) / len(games), 1)
 
     result.wins_by_damage = sum(1 for g in games if g.won and g.reason == "damage")
+    result.wins_by_combo = sum(1 for g in games if g.won and g.reason == "combo")
     result.losses_by_clock = sum(1 for g in games if not g.won and g.reason == "opponent_clock")
     result.losses_by_timeout = sum(1 for g in games if not g.won and g.reason == "timeout")
 
@@ -258,3 +346,35 @@ def _aggregate_matchup(
         result.game_results = games
 
     return result
+
+
+def _aggregate_matchup_combos(
+    matchup: MatchupResult,
+    games: list[MatchupGameResult],
+    simulations: int,
+    combos: list[Combo],
+) -> None:
+    """Fill in combo_win_rate / avg_combo_win_turn / top_combo_lines.
+
+    Called after the standard matchup aggregation. No-op when combos
+    is empty so callers that don't pass combos see the same shape as
+    before this feature.
+    """
+    if not combos or simulations <= 0:
+        return
+    combo_wins = [g for g in games if g.reason == "combo" and g.combo_win_turn]
+    if not combo_wins:
+        return
+    matchup.combo_win_rate = round(len(combo_wins) / simulations, 4)
+    matchup.avg_combo_win_turn = round(
+        sum(g.combo_win_turn for g in combo_wins) / len(combo_wins), 2,
+    )
+    label_for: dict[str, str] = {c.combo_id: c.short_label() for c in combos}
+    from collections import Counter as _C
+    fire_counter: _C[str] = _C(
+        g.combo_id_fired for g in combo_wins if g.combo_id_fired
+    )
+    matchup.top_combo_lines = [
+        (cid, label_for.get(cid, cid), count, round(count / simulations, 4))
+        for cid, count in fire_counter.most_common(5)
+    ]

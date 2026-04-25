@@ -2379,24 +2379,7 @@ class AppApi:
         deck = self._build_deck(decklist_text, format_, name)
         if isinstance(deck, dict):  # error envelope
             return deck
-        # Pull combos that touch any deck card from the local cache when
-        # available. The runner pre-filters to only deck-relevant combos
-        # so passing the full set is safe but wasteful — we narrow up
-        # front via the per-card index for speed.
-        combos = []
-        if include_combos:
-            store = self._get_combo_store()
-            if store.combo_count() > 0:
-                seen_ids: set[str] = set()
-                deck_card_names = {e.card.name for e in deck.entries if e.card}
-                for name in deck_card_names:
-                    for cid in store.lookup_combos_for_card(name):
-                        if cid in seen_ids:
-                            continue
-                        seen_ids.add(cid)
-                        c = store.get_combo(cid)
-                        if c is not None:
-                            combos.append(c)
+        combos = self._fetch_relevant_combos(deck) if include_combos else []
         report = run_goldfish_batch(deck, simulations=sims, seed=seed, combos=combos)
         return _goldfish_to_dict(report)
 
@@ -2404,15 +2387,47 @@ class AppApi:
     def run_gauntlet(
         self, decklist_text: str, format_: str | None = None,
         name: str = "Deck", sims: int = 200, seed: int | None = None,
+        include_combos: bool = True,
     ) -> dict:
         """Run matchup gauntlet against 11 archetypes. Sync — typically
-        30-60s total (200 sims × 11 archetypes)."""
+        30-60s total (200 sims × 11 archetypes).
+
+        When include_combos is True (default) and the user has refreshed
+        their Commander Spellbook combo cache, every archetype matchup
+        also tracks combo-as-win-condition. The serializer surfaces
+        per-matchup wins_by_combo / combo_win_rate / avg_combo_win_turn
+        and the gauntlet-wide combo_win_rate_overall + top_combo_lines_overall.
+        """
         from densa_deck.matchup.gauntlet import run_gauntlet as _run
         deck = self._build_deck(decklist_text, format_, name)
         if isinstance(deck, dict):
             return deck
-        report = _run(deck, simulations=sims, seed=seed)
+        combos = self._fetch_relevant_combos(deck) if include_combos else []
+        report = _run(deck, simulations=sims, seed=seed, combos=combos)
         return _gauntlet_to_dict(report)
+
+    def _fetch_relevant_combos(self, deck) -> list:
+        """Pull deck-relevant combos from the local cache, if populated.
+
+        Mirrors the goldfish path so gauntlet / duel can share the
+        narrowing — only combos with at least one card in the deck are
+        worth checking. Empty list when the cache hasn't been refreshed.
+        """
+        store = self._get_combo_store()
+        if store.combo_count() == 0:
+            return []
+        seen_ids: set[str] = set()
+        out: list = []
+        deck_card_names = {e.card.name for e in deck.entries if e.card}
+        for n in deck_card_names:
+            for cid in store.lookup_combos_for_card(n):
+                if cid in seen_ids:
+                    continue
+                seen_ids.add(cid)
+                c = store.get_combo(cid)
+                if c is not None:
+                    out.append(c)
+        return out
 
     @_safe
     def duel_decks(
@@ -2478,11 +2493,19 @@ class AppApi:
 
         # Run both perspectives so the result is symmetric: A-sees-B and
         # B-sees-A using the same sim engine. Win-rate + kill-turn come
-        # from each perspective directly.
-        a_vs_b = simulate_matchup(a_ctx["deck"], b_ctx["profile"], simulations=sims, seed=seed)
+        # from each perspective directly. Combo lists are per-deck so
+        # each side gets its own — A's combos applied to A's games,
+        # B's combos applied to B's games.
+        a_combos = self._fetch_relevant_combos(a_ctx["deck"])
+        b_combos = self._fetch_relevant_combos(b_ctx["deck"])
+        a_vs_b = simulate_matchup(
+            a_ctx["deck"], b_ctx["profile"], simulations=sims, seed=seed,
+            combos=a_combos,
+        )
         b_vs_a = simulate_matchup(
             b_ctx["deck"], a_ctx["profile"], simulations=sims,
             seed=(seed + 1) if seed is not None else None,
+            combos=b_combos,
         )
 
         def _side_summary(ctx, result):
@@ -2508,8 +2531,13 @@ class AppApi:
                 "avg_damage_taken": round(float(result.avg_opponent_damage), 2),
                 "avg_permanents_removed": round(float(result.avg_permanents_removed), 2),
                 "wins_by_damage": int(result.wins_by_damage),
+                "wins_by_combo": int(getattr(result, "wins_by_combo", 0) or 0),
                 "losses_by_clock": int(result.losses_by_clock),
                 "losses_by_timeout": int(result.losses_by_timeout),
+                "combos_evaluated": int(getattr(result, "combos_evaluated", 0) or 0),
+                "combo_win_rate": round(float(getattr(result, "combo_win_rate", 0.0) or 0.0) * 100.0, 1),
+                "avg_combo_win_turn": round(float(getattr(result, "avg_combo_win_turn", 0.0) or 0.0), 2),
+                "top_combo_lines": [list(p) for p in getattr(result, "top_combo_lines", [])],
             }
 
         return {
@@ -3032,6 +3060,13 @@ def _gauntlet_to_dict(report) -> dict:
         "resilience_score": report.resilience_score,
         "interaction_score": report.interaction_score,
         "consistency_score": report.consistency_score,
+        # Combo aggregates — zero/empty when no combos were tracked.
+        "combos_evaluated": getattr(report, "combos_evaluated", 0),
+        "combo_win_rate_overall": getattr(report, "combo_win_rate_overall", 0.0),
+        "avg_combo_win_turn_overall": getattr(report, "avg_combo_win_turn_overall", 0.0),
+        "top_combo_lines_overall": [
+            list(p) for p in getattr(report, "top_combo_lines_overall", [])
+        ],
         "matchups": [
             {
                 "archetype": m.archetype_name,
@@ -3040,6 +3075,11 @@ def _gauntlet_to_dict(report) -> dict:
                 "simulations": m.simulations,
                 "win_rate": m.win_rate,
                 "avg_turns": m.avg_turns,
+                "wins_by_damage": int(getattr(m, "wins_by_damage", 0) or 0),
+                "wins_by_combo": int(getattr(m, "wins_by_combo", 0) or 0),
+                "combos_evaluated": int(getattr(m, "combos_evaluated", 0) or 0),
+                "combo_win_rate": float(getattr(m, "combo_win_rate", 0.0) or 0.0),
+                "avg_combo_win_turn": float(getattr(m, "avg_combo_win_turn", 0.0) or 0.0),
             }
             for m in report.matchups
         ],

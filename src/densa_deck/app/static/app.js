@@ -1369,7 +1369,9 @@ function renderDuelResult(r) {
           <div><span class="label">Avg dmg dealt</span><span>${a.avg_damage_dealt.toFixed(1)}</span></div>
           <div><span class="label">Avg dmg taken</span><span>${a.avg_damage_taken.toFixed(1)}</span></div>
           <div><span class="label">Wins by damage</span><span>${a.wins_by_damage}</span></div>
+          ${a.combos_evaluated ? `<div><span class="label">Wins by combo</span><span>${a.wins_by_combo} (${a.combo_win_rate.toFixed(1)}%)</span></div>` : ""}
           <div><span class="label">Losses by clock</span><span>${a.losses_by_clock}</span></div>
+          ${a.combos_evaluated && a.avg_combo_win_turn ? `<div><span class="label">Avg combo turn</span><span>${a.avg_combo_win_turn.toFixed(1)}</span></div>` : ""}
         </div>
       </div>
       <div class="duel-vs">VS</div>
@@ -1383,7 +1385,9 @@ function renderDuelResult(r) {
           <div><span class="label">Avg dmg dealt</span><span>${b.avg_damage_dealt.toFixed(1)}</span></div>
           <div><span class="label">Avg dmg taken</span><span>${b.avg_damage_taken.toFixed(1)}</span></div>
           <div><span class="label">Wins by damage</span><span>${b.wins_by_damage}</span></div>
+          ${b.combos_evaluated ? `<div><span class="label">Wins by combo</span><span>${b.wins_by_combo} (${b.combo_win_rate.toFixed(1)}%)</span></div>` : ""}
           <div><span class="label">Losses by clock</span><span>${b.losses_by_clock}</span></div>
+          ${b.combos_evaluated && b.avg_combo_win_turn ? `<div><span class="label">Avg combo turn</span><span>${b.avg_combo_win_turn.toFixed(1)}</span></div>` : ""}
         </div>
       </div>
     </div>
@@ -1621,15 +1625,57 @@ function renderGauntlet(r) {
   els.gauntlet_result.classList.remove("hidden");
   const rateClass = (wr) => wr >= 0.55 ? "rate-high" : wr >= 0.40 ? "rate-mid" : "rate-low";
 
+  const combosOn = (r.combos_evaluated || 0) > 0;
+
+  // The Combo % column shows the share of WINS (not all games) that
+  // closed via combo for that archetype — so a 70% win-rate matchup
+  // with 40% combo wins reads "combo closed 4/7 of the wins".
   const rows = (r.matchups || [])
     .slice()
     .sort((a, b) => b.win_rate - a.win_rate)
-    .map(m => `<tr>
-      <td>${escape(m.archetype)}</td>
-      <td>${m.wins}/${m.simulations}</td>
-      <td class="${rateClass(m.win_rate)}">${(m.win_rate * 100).toFixed(0)}%</td>
-      <td>${m.avg_turns.toFixed(1)}</td>
-    </tr>`).join("");
+    .map(m => {
+      const winShareCombo = m.wins > 0 ? (m.wins_by_combo / m.wins) : 0;
+      const comboCol = combosOn
+        ? `<td title="${m.wins_by_combo} of ${m.wins} wins closed via combo">${m.wins_by_combo ? `${(winShareCombo * 100).toFixed(0)}%` : "—"}</td>`
+        : "";
+      const comboTurnCol = combosOn
+        ? `<td>${m.avg_combo_win_turn ? m.avg_combo_win_turn.toFixed(1) : "—"}</td>`
+        : "";
+      return `<tr>
+        <td>${escape(m.archetype)}</td>
+        <td>${m.wins}/${m.simulations}</td>
+        <td class="${rateClass(m.win_rate)}">${(m.win_rate * 100).toFixed(0)}%</td>
+        <td>${m.avg_turns.toFixed(1)}</td>
+        ${comboCol}
+        ${comboTurnCol}
+      </tr>`;
+    }).join("");
+
+  const comboHeader = combosOn
+    ? `<th title="Share of this archetype's wins that closed via combo assembly">Combo % of wins</th><th>Combo turn</th>`
+    : "";
+
+  // Overall combo card next to the win-rate cards. Hidden when no combos
+  // evaluated so existing decks render the same as before.
+  const comboOverallCard = combosOn ? `
+    <div class="stat-card">
+      <div class="label">Combo wins</div>
+      <div class="value">${(r.combo_win_rate_overall * 100).toFixed(0)}%</div>
+      <div class="sub">${r.avg_combo_win_turn_overall ? `turn ${r.avg_combo_win_turn_overall.toFixed(1)} avg` : "no combos closed"}</div>
+    </div>
+  ` : "";
+
+  // Top firing combos block — shown beneath the table when any combo fired.
+  const topLines = (r.top_combo_lines_overall || []).slice(0, 5).map(([id, label, count, rate]) =>
+    `<li><strong>${escape(label)}</strong> &middot; <span class="status-text">${count} game${count === 1 ? "" : "s"} (${(rate * 100).toFixed(1)}%)</span></li>`,
+  ).join("");
+  const comboTopSection = combosOn && topLines ? `
+    <div class="result-section">
+      <h3>Top firing combos across the gauntlet</h3>
+      <p class="panel-hint">${r.combos_evaluated} combo line${r.combos_evaluated === 1 ? "" : "s"} tracked. A win is attributed to combo when all pieces are assembled before the opponent's clock kills you.</p>
+      <ul class="rec-list">${topLines}</ul>
+    </div>
+  ` : "";
 
   els.gauntlet_result.innerHTML = `
     <div class="panel">
@@ -1639,13 +1685,14 @@ function renderGauntlet(r) {
         <div class="stat-card"><div class="label">Meta-weighted</div><div class="value">${(r.weighted_win_rate * 100).toFixed(0)}%</div><div class="sub">weighted by meta share</div></div>
         <div class="stat-card"><div class="label">Best matchup</div><div class="value" style="font-size:1rem">${escape(r.best_matchup)}</div><div class="sub">${(r.best_win_rate * 100).toFixed(0)}%</div></div>
         <div class="stat-card"><div class="label">Worst matchup</div><div class="value" style="font-size:1rem">${escape(r.worst_matchup)}</div><div class="sub">${(r.worst_win_rate * 100).toFixed(0)}%</div></div>
+        ${comboOverallCard}
       </div>
 
       <div class="panel-row" style="gap:20px">
         <div style="flex:2">
           <h3>Per-archetype results</h3>
           <table class="gauntlet-table">
-            <thead><tr><th>Archetype</th><th>Wins/Sims</th><th>Win %</th><th>Avg turns</th></tr></thead>
+            <thead><tr><th>Archetype</th><th>Wins/Sims</th><th>Win %</th><th>Avg turns</th>${comboHeader}</tr></thead>
             <tbody>${rows}</tbody>
           </table>
         </div>
@@ -1657,6 +1704,8 @@ function renderGauntlet(r) {
           <div class="score-row"><span class="axis">Consistency</span><span class="bar"><span class="bar-fill" style="width:${r.consistency_score}%"></span></span><span class="value">${r.consistency_score.toFixed(0)}</span></div>
         </div>
       </div>
+
+      ${comboTopSection}
     </div>
   `;
   els.gauntlet_result.scrollIntoView({ behavior: "smooth", block: "start" });

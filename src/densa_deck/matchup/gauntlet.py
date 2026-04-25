@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 
 from rich.console import Console
 
+from densa_deck.combos.models import Combo
 from densa_deck.matchup.archetypes import (
     ArchetypeProfile,
     get_default_gauntlet,
@@ -47,6 +48,13 @@ class GauntletReport:
     interaction_score: float = 0.0   # How well we handle opponent pressure
     consistency_score: float = 0.0   # Variance in performance
 
+    # Combo aggregates (zero / empty when run_gauntlet was called without combos)
+    combos_evaluated: int = 0
+    combo_win_rate_overall: float = 0.0  # share of all gauntlet games won by combo
+    avg_combo_win_turn_overall: float = 0.0
+    # Across-archetype top combo lines (id, short_label, count_total, rate)
+    top_combo_lines_overall: list[tuple[str, str, int, float]] = field(default_factory=list)
+
 
 def run_gauntlet(
     deck: Deck,
@@ -54,8 +62,17 @@ def run_gauntlet(
     simulations: int = 500,
     max_turns: int = 12,
     seed: int | None = None,
+    combos: list[Combo] | None = None,
 ) -> GauntletReport:
-    """Run a deck against a gauntlet of archetypes."""
+    """Run a deck against a gauntlet of archetypes.
+
+    When `combos` is non-empty, each archetype matchup also tracks
+    combo-as-win-condition: turns where the deck assembles a combo
+    line before the opponent closes count as wins via combo. Each
+    MatchupResult exposes combo_win_rate / wins_by_combo /
+    avg_combo_win_turn, and the GauntletReport aggregates the gauntlet-
+    wide combo win rate + top firing combos.
+    """
     if archetypes is None:
         archetypes = get_default_gauntlet()
 
@@ -74,6 +91,7 @@ def run_gauntlet(
             simulations=simulations,
             max_turns=max_turns,
             seed=matchup_seed,
+            combos=combos,
         )
         report.matchups.append(result)
         report.total_games += simulations
@@ -82,8 +100,50 @@ def run_gauntlet(
 
     # Compute aggregates
     _compute_aggregates(report, archetypes)
+    # Combo aggregates — separate pass so the existing _compute_aggregates
+    # stays focused on the historical metrics.
+    _compute_combo_aggregates(report)
 
     return report
+
+
+def _compute_combo_aggregates(report: GauntletReport) -> None:
+    """Sum combo-wins across all matchups + collect top combo lines."""
+    if not report.matchups:
+        return
+    # combos_evaluated should be the same across all matchups (we pass
+    # the same combos list); take the first non-zero value to surface.
+    for m in report.matchups:
+        if m.combos_evaluated:
+            report.combos_evaluated = m.combos_evaluated
+            break
+    total_combo_wins = sum(m.wins_by_combo for m in report.matchups)
+    if not total_combo_wins or report.total_games <= 0:
+        return
+    report.combo_win_rate_overall = round(total_combo_wins / report.total_games, 4)
+
+    # Average combo turn weighted by combo-win count per matchup.
+    weighted_turn_sum = 0.0
+    total = 0
+    for m in report.matchups:
+        if m.wins_by_combo and m.avg_combo_win_turn:
+            weighted_turn_sum += m.avg_combo_win_turn * m.wins_by_combo
+            total += m.wins_by_combo
+    if total:
+        report.avg_combo_win_turn_overall = round(weighted_turn_sum / total, 2)
+
+    # Collapse top_combo_lines across matchups.
+    from collections import Counter as _C
+    label_for: dict[str, str] = {}
+    counter: _C[str] = _C()
+    for m in report.matchups:
+        for cid, label, count, _rate in m.top_combo_lines:
+            label_for.setdefault(cid, label)
+            counter[cid] += count
+    report.top_combo_lines_overall = [
+        (cid, label_for.get(cid, cid), n, round(n / report.total_games, 4))
+        for cid, n in counter.most_common(5)
+    ]
 
 
 def _compute_aggregates(report: GauntletReport, archetypes: list[ArchetypeProfile]):
