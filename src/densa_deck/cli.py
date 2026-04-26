@@ -255,6 +255,14 @@ def main():
         "--read-only", action="store_true",
         help="Skip registering Pro tools entirely — agent can't see goldfish/gauntlet/coach",
     )
+    mcp_serve.add_argument(
+        "--tools", type=str, default="",
+        metavar="NAMES",
+        help="Comma-separated tool names to expose (e.g. 'search_cards,analyze_deck'). "
+             "Filters the registered surface to the named subset. Useful for "
+             "smaller-context AI clients (the 14B-model regression cliff hits "
+             "around ~10 tools). Default: all tools per --read-only mode.",
+    )
 
     # analyst command (Pro) — manage the local GGUF model for the LLM analyst layer
     analyst_parser = subparsers.add_parser(
@@ -1435,20 +1443,48 @@ def cmd_mcp(args):
     action = getattr(args, "mcp_action", None)
     if action != "serve":
         console.print(
-            "[yellow]Usage: densa-deck mcp serve [--read-only][/yellow]\n"
+            "[yellow]Usage: densa-deck mcp serve [--read-only] [--tools NAMES][/yellow]\n"
             "[dim]Add this server to your AI client's MCP config to drive "
             "the engine via tool calls.[/dim]"
         )
         return
+
+    # Operator kill switch: MTG_ENGINE_MCP=disabled or
+    # ~/.densa-deck/config.json {"mcp_enabled": false}. Checked BEFORE
+    # any MCP code imports so a paranoid install never loads the SDK.
+    from densa_deck.mcp.license_gate import mcp_enabled
+    enabled, reason = mcp_enabled()
+    if not enabled:
+        console.print(
+            f"[yellow]MCP server is disabled by operator setting "
+            f"({reason}).[/yellow]\n"
+            "[dim]Remove the env var or flip mcp_enabled back to true in "
+            "~/.densa-deck/config.json to re-enable.[/dim]"
+        )
+        sys.exit(2)
+
+    # Parse --tools whitelist (comma-separated). Empty/None = expose
+    # the full tier-appropriate surface.
+    tools_raw = getattr(args, "tools", "") or ""
+    tool_pack = [t.strip() for t in tools_raw.split(",") if t.strip()]
+
     # Lazy import — keeps the rest of the CLI importable even when the
     # optional `mcp` SDK isn't installed.
     from densa_deck.mcp.server import McpSdkMissingError, run_stdio_server
     try:
-        run_stdio_server(read_only=getattr(args, "read_only", False))
+        run_stdio_server(
+            read_only=getattr(args, "read_only", False),
+            tool_pack=tool_pack or None,
+        )
     except McpSdkMissingError as e:
         # SDK missing is a setup gap, not a runtime crash — show the
         # install hint cleanly and exit nonzero so scripts can detect it.
         console.print(f"[yellow]{e}[/yellow]")
+        sys.exit(1)
+    except ValueError as e:
+        # build_server raises ValueError for unknown --tools names so
+        # the user sees a typo before the server starts.
+        console.print(f"[red]{e}[/red]")
         sys.exit(1)
 
 

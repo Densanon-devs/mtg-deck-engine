@@ -49,11 +49,22 @@ def _import_fastmcp():
     return FastMCP
 
 
-def build_server(read_only: bool = False, api: "AppApi | None" = None):
+def build_server(
+    read_only: bool = False,
+    api: "AppApi | None" = None,
+    tool_pack: "list[str] | None" = None,
+):
     """Build a FastMCP server with the tool surface registered.
 
     `api` is optional — pass an instance for tests; production builds a
     fresh one against the user's `~/.densa-deck/` data directory.
+
+    `tool_pack` is an optional whitelist of tool names. When provided,
+    only those tools register (interaction with `read_only`: the
+    intersection is what gets exposed). Useful for smaller-context AI
+    clients hitting the 14B regression cliff. Unknown names raise
+    ValueError so the user catches typos before the server starts —
+    not after the AI silently can't find a tool it expected.
     """
     FastMCP = _import_fastmcp()
 
@@ -73,43 +84,60 @@ def build_server(read_only: bool = False, api: "AppApi | None" = None):
     if api is None:
         api = AppApi()
 
-    # Free tools: always registered.
-    free = tools_mod.make_free_tools(api)
-    for name, fn in free.items():
-        mcp.tool(name=name)(fn)
-
-    # Pro tools: skipped entirely in read-only mode (so a less-trusted
-    # agent can't even see them in the tool list). Otherwise registered
-    # with the per-tool assert_pro() defense in depth — a free user
-    # invoking one gets a clear ProRequiredError.
+    # Build the candidate tool set. Pro tools are dropped entirely in
+    # read-only mode (so a less-trusted agent can't even see them).
+    candidates: dict[str, object] = {}
+    candidates.update(tools_mod.make_free_tools(api))
     if not read_only:
-        pro = tools_mod.make_pro_tools(api)
-        for name, fn in pro.items():
-            mcp.tool(name=name)(fn)
+        candidates.update(tools_mod.make_pro_tools(api))
+
+    # Apply --tools whitelist. Validate strictly: an unknown name in the
+    # pack is a typo on the operator's part, and silently dropping it
+    # would mean the AI client gets a smaller surface than expected
+    # without any signal — exactly the failure mode we want to avoid.
+    if tool_pack is not None:
+        unknown = [name for name in tool_pack if name not in candidates]
+        if unknown:
+            raise ValueError(
+                f"Unknown MCP tool name(s): {', '.join(unknown)}. "
+                f"Available {'free' if read_only else 'free+pro'} tools: "
+                f"{', '.join(sorted(candidates))}."
+            )
+        candidates = {name: candidates[name] for name in tool_pack}
+
+    for name, fn in candidates.items():
+        mcp.tool(name=name)(fn)
 
     return mcp
 
 
-def run_stdio_server(read_only: bool = False) -> None:
+def run_stdio_server(
+    read_only: bool = False,
+    tool_pack: "list[str] | None" = None,
+) -> None:
     """Build the server and run it on stdio. CLI entry point.
 
     Logs a one-line tier banner to stderr so the user can see "Free tier"
     vs "Pro tier" without it polluting the JSON-RPC channel on stdout.
+    When a `tool_pack` whitelist is active, the banner names it so the
+    user can confirm the curated surface matches what their AI client
+    expects.
 
     Owns the AppApi lifetime — closes it in a `finally` so SQLite
     connections (cards.db, versions.db, combos.db) and any background
     threads are cleaned up when the AI client closes the subprocess.
     """
     tier = current_tier()
+    pack_note = f", tools={','.join(tool_pack)}" if tool_pack else ""
     sys.stderr.write(
         f"Densa Deck MCP server ready ({tier.value} tier"
-        f"{', read-only' if read_only else ''}).\n"
+        f"{', read-only' if read_only else ''}{pack_note}).\n"
     )
     sys.stderr.flush()
 
     api = AppApi()
     try:
-        server = build_server(read_only=read_only, api=api)
+        server = build_server(read_only=read_only, api=api, tool_pack=tool_pack)
         server.run(transport="stdio")
     finally:
         try:
