@@ -21,7 +21,7 @@
 ; prototype — changing it means the new installer treats this as a fresh
 ; product (no in-place upgrades from the pre-rename prototype builds).
 #define AppId "{{DENSA-DECK-DB8A4F1E-7C3B-4D92-9A6E-5F3C1B7E8A2D}}"
-#define AppVersion "0.1.6"
+#define AppVersion "0.3.0"
 #define AppPublisher "Densanon LLC"
 #define AppURL "https://toolkit.densanon.com/densa-deck.html"
 #define AppExeName "densa-deck.exe"

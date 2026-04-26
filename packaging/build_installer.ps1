@@ -28,13 +28,18 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed (exit $LASTEXITCODE)" }
 
     # Step 2: Inno Setup
-    $ISCC = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
-    if (-not (Test-Path $ISCC)) {
-        # Try the default on 64-bit-native systems
-        $ISCC = "C:\Program Files\Inno Setup 6\ISCC.exe"
-    }
-    if (-not (Test-Path $ISCC)) {
-        throw "ISCC.exe not found. Install Inno Setup 6 from https://jrsoftware.org/isinfo.php"
+    # Probe the three install paths Inno Setup 6 lands at: 32-bit Program
+    # Files (the default), 64-bit Program Files (rare), and per-user
+    # AppData\Local\Programs (what `winget install JRSoftware.InnoSetup`
+    # picks when there's no UAC elevation available).
+    $candidates = @(
+        "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
+        "C:\Program Files\Inno Setup 6\ISCC.exe",
+        (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe')
+    )
+    $ISCC = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if (-not $ISCC) {
+        throw "ISCC.exe not found. Install Inno Setup 6 from https://jrsoftware.org/isinfo.php (or via `winget install JRSoftware.InnoSetup`)."
     }
     Write-Host "[2/2] Running Inno Setup..." -ForegroundColor Cyan
     & $ISCC "packaging\installer.iss"
