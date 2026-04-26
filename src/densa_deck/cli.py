@@ -1442,8 +1442,14 @@ def cmd_mcp(args):
         return
     # Lazy import — keeps the rest of the CLI importable even when the
     # optional `mcp` SDK isn't installed.
-    from densa_deck.mcp.server import run_stdio_server
-    run_stdio_server(read_only=getattr(args, "read_only", False))
+    from densa_deck.mcp.server import McpSdkMissingError, run_stdio_server
+    try:
+        run_stdio_server(read_only=getattr(args, "read_only", False))
+    except McpSdkMissingError as e:
+        # SDK missing is a setup gap, not a runtime crash — show the
+        # install hint cleanly and exit nonzero so scripts can detect it.
+        console.print(f"[yellow]{e}[/yellow]")
+        sys.exit(1)
 
 
 def cmd_register_protocol(args):

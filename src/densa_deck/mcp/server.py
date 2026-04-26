@@ -25,14 +25,21 @@ from densa_deck.mcp import tools as tools_mod
 from densa_deck.mcp.license_gate import current_tier
 
 
+class McpSdkMissingError(RuntimeError):
+    """Raised when `build_server()` is called without the `mcp` SDK
+    installed. Distinct from ImportError so the CLI entry point can
+    catch it and print a clean install hint without exiting through
+    the generic exception path. Tests can also catch it to skip cleanly."""
+
+
 def _import_fastmcp():
     """Lazy-import FastMCP so the rest of the package stays importable
     without the `mcp` dep installed (matters for tests that don't need
-    the protocol surface)."""
+    the protocol surface, and for the CLI's `mcp --help` path)."""
     try:
         from mcp.server.fastmcp import FastMCP
     except ImportError as e:
-        raise SystemExit(
+        raise McpSdkMissingError(
             "The MCP server requires the 'mcp' SDK. Install with:\n"
             "    pip install 'densa-deck[mcp]'\n"
             "or:\n"
@@ -88,6 +95,10 @@ def run_stdio_server(read_only: bool = False) -> None:
 
     Logs a one-line tier banner to stderr so the user can see "Free tier"
     vs "Pro tier" without it polluting the JSON-RPC channel on stdout.
+
+    Owns the AppApi lifetime — closes it in a `finally` so SQLite
+    connections (cards.db, versions.db, combos.db) and any background
+    threads are cleaned up when the AI client closes the subprocess.
     """
     tier = current_tier()
     sys.stderr.write(
@@ -96,5 +107,13 @@ def run_stdio_server(read_only: bool = False) -> None:
     )
     sys.stderr.flush()
 
-    server = build_server(read_only=read_only)
-    server.run(transport="stdio")
+    api = AppApi()
+    try:
+        server = build_server(read_only=read_only, api=api)
+        server.run(transport="stdio")
+    finally:
+        try:
+            api.close()
+        except Exception:
+            # Don't mask the real exit reason with a cleanup error.
+            pass
