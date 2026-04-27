@@ -71,6 +71,9 @@ function cacheElements() {
     "ingest-progress-fill", "ingest-progress-msg",
     "analyst-model-select", "analyst-pull-btn", "analyst-pull-status",
     "analyst-pull-progress-wrap", "analyst-pull-progress-fill", "analyst-pull-progress-msg",
+    // MCP — AI client integration panel
+    "mcp-status", "mcp-show-config-btn", "mcp-verify-btn", "mcp-status-text",
+    "mcp-config-block", "mcp-config-text", "mcp-copy-config-btn", "mcp-copy-status",
   ];
   ids.forEach(id => { els[id.replace(/-/g, "_")] = $(id); });
 }
@@ -316,6 +319,16 @@ async function bootstrap() {
   }
   if (els.combo_refresh_btn) {
     els.combo_refresh_btn.addEventListener("click", startComboRefresh);
+  }
+  // MCP — AI client integration panel
+  if (els.mcp_show_config_btn) {
+    els.mcp_show_config_btn.addEventListener("click", showMcpConfig);
+  }
+  if (els.mcp_verify_btn) {
+    els.mcp_verify_btn.addEventListener("click", verifyMcp);
+  }
+  if (els.mcp_copy_config_btn) {
+    els.mcp_copy_config_btn.addEventListener("click", copyMcpConfig);
   }
 
   // Delegated handler for "Why? (Pro)" buttons next to unreliable cards
@@ -707,6 +720,91 @@ async function startComboRefresh() {
     els.combo_refresh_btn.disabled = false;
     els.combo_refresh_status.textContent = "";
     toast("Combo refresh failed to start: " + e.message, "error");
+  }
+}
+
+// ------------------------------ MCP (AI client integration) ------------------------------
+
+async function loadMcpStatus() {
+  if (!els.mcp_status) return;
+  try {
+    const s = await callApi("get_mcp_status");
+    if (!s) return;
+    if (!s.enabled) {
+      els.mcp_status.innerHTML = `<div class="card warning"><strong>MCP server is disabled</strong><br>${escape(s.reason || "Operator setting blocked it.")}</div>`;
+      // Hide the action buttons when disabled — running them won't help.
+      els.mcp_show_config_btn.disabled = true;
+      els.mcp_verify_btn.disabled = true;
+      return;
+    }
+    if (!s.sdk_present) {
+      els.mcp_status.innerHTML = `<div class="card warning"><strong>MCP SDK not bundled</strong><br>This install of Densa Deck doesn't include the MCP runtime. The bundled installer / portable ZIP includes it; pip-installs need <code>pip install 'densa-deck[mcp]'</code>.</div>`;
+      els.mcp_show_config_btn.disabled = true;
+      els.mcp_verify_btn.disabled = true;
+      return;
+    }
+    const tierLabel = s.tier === "pro" ? "Pro tier — 28 tools available" : "Free tier — 17 tools (Pro tools unlock with a license)";
+    els.mcp_status.innerHTML = `<div class="card ready"><strong>MCP server ready</strong> &middot; <span class="status-text">${escape(tierLabel)}</span></div>`;
+    els.mcp_show_config_btn.disabled = false;
+    els.mcp_verify_btn.disabled = false;
+  } catch (e) {
+    els.mcp_status.innerHTML = `<div class="card missing"><strong>MCP status unavailable</strong><br>${escape(e.message)}</div>`;
+  }
+}
+
+async function showMcpConfig() {
+  els.mcp_status_text.textContent = "";
+  try {
+    const r = await callApi("get_mcp_config_block");
+    if (!r || !r.config_text) {
+      toast("Couldn't generate config block.", "error");
+      return;
+    }
+    els.mcp_config_text.value = r.config_text;
+    els.mcp_config_block.classList.remove("hidden");
+  } catch (e) {
+    toast("Failed to generate config: " + e.message, "error");
+  }
+}
+
+async function copyMcpConfig() {
+  const text = els.mcp_config_text.value;
+  if (!text) return;
+  try {
+    await navigator.clipboard.writeText(text);
+    els.mcp_copy_status.textContent = "Copied to clipboard.";
+    setTimeout(() => { els.mcp_copy_status.textContent = ""; }, 3000);
+  } catch (e) {
+    // Some environments deny clipboard access; fall back to selecting
+    // the text so the user can hit Ctrl+C themselves.
+    els.mcp_config_text.focus();
+    els.mcp_config_text.select();
+    els.mcp_copy_status.textContent = "Press Ctrl+C to copy.";
+    setTimeout(() => { els.mcp_copy_status.textContent = ""; }, 5000);
+  }
+}
+
+async function verifyMcp() {
+  els.mcp_status_text.textContent = "Verifying...";
+  els.mcp_verify_btn.disabled = true;
+  try {
+    const r = await callApi("selftest_mcp");
+    if (r && r.success) {
+      els.mcp_status_text.innerHTML =
+        `<span style="color:var(--color-accent-green, #34d399);font-weight:600">&#10003;</span> ` +
+        `MCP server starts cleanly &middot; ${r.tool_count} tools registered (${escape(r.tier)} tier).`;
+    } else {
+      const kind = (r && r.failure_kind) || "unknown";
+      const msg = (r && r.failure_msg) || "Unknown failure.";
+      els.mcp_status_text.innerHTML =
+        `<span style="color:#ff9999;font-weight:600">&#10007;</span> ` +
+        `${escape(kind)}: ${escape(msg)}`;
+    }
+  } catch (e) {
+    els.mcp_status_text.innerHTML =
+      `<span style="color:#ff9999;font-weight:600">&#10007;</span> Failed: ${escape(e.message)}`;
+  } finally {
+    els.mcp_verify_btn.disabled = false;
   }
 }
 
@@ -1594,6 +1692,7 @@ async function refreshSettings() {
     `;
     await loadUserPrefsIntoSettings();
     await loadComboStatus();
+    await loadMcpStatus();
   } catch (e) {
     toast("Settings refresh failed: " + e.message, "error");
   }

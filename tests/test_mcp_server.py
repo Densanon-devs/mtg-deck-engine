@@ -323,6 +323,189 @@ class TestKillSwitch:
         assert enabled is True
 
 
+class TestMcpConfigCommand:
+    """`densa-deck mcp config` emits a paste-ready Claude desktop config
+    with the install's exe path resolved. Closes the PATH gap on Inno
+    installer customers."""
+
+    def test_emits_valid_json_block(self):
+        import subprocess, sys, json
+        env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+        r = subprocess.run(
+            [sys.executable, "-m", "densa_deck.cli", "mcp", "config"],
+            capture_output=True, encoding="utf-8", errors="replace",
+            timeout=10, env=env,
+        )
+        assert r.returncode == 0
+        # The JSON block sits in stdout; the surrounding hint copy is
+        # also there, so we have to extract.
+        start = r.stdout.find("{")
+        end = r.stdout.rfind("}")
+        assert start >= 0 and end > start, f"no JSON block found: {r.stdout[:300]}"
+        block = json.loads(r.stdout[start:end + 1])
+        assert "mcpServers" in block
+        assert "densa-deck" in block["mcpServers"]
+        entry = block["mcpServers"]["densa-deck"]
+        assert "command" in entry and entry["command"]
+        assert entry["args"][:2] == ["mcp", "serve"]
+
+    def test_read_only_flag_is_passed_through(self):
+        import subprocess, sys, json
+        env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+        r = subprocess.run(
+            [sys.executable, "-m", "densa_deck.cli", "mcp", "config", "--read-only"],
+            capture_output=True, encoding="utf-8", errors="replace",
+            timeout=10, env=env,
+        )
+        assert r.returncode == 0
+        start = r.stdout.find("{")
+        end = r.stdout.rfind("}")
+        block = json.loads(r.stdout[start:end + 1])
+        args = block["mcpServers"]["densa-deck"]["args"]
+        assert "--read-only" in args
+
+    def test_tools_flag_is_passed_through(self):
+        import subprocess, sys, json
+        env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+        r = subprocess.run(
+            [sys.executable, "-m", "densa_deck.cli", "mcp", "config",
+             "--tools", "search_cards,analyze_deck"],
+            capture_output=True, encoding="utf-8", errors="replace",
+            timeout=10, env=env,
+        )
+        assert r.returncode == 0
+        start = r.stdout.find("{")
+        end = r.stdout.rfind("}")
+        block = json.loads(r.stdout[start:end + 1])
+        args = block["mcpServers"]["densa-deck"]["args"]
+        assert "--tools" in args
+        assert "search_cards,analyze_deck" in args
+
+
+class TestMcpSelftestCommand:
+    """`densa-deck mcp selftest` is the "verify the server side works
+    without involving Claude desktop" support tool. Exits 0 on success
+    with a clear summary line."""
+
+    def test_selftest_succeeds_in_pro_mode(self, tmp_path):
+        import subprocess, sys
+        env = {**os.environ, "MTG_ENGINE_TIER": "pro",
+               "PYTHONIOENCODING": "utf-8",
+               "HOME": str(tmp_path), "USERPROFILE": str(tmp_path)}
+        r = subprocess.run(
+            [sys.executable, "-m", "densa_deck.cli", "mcp", "selftest"],
+            capture_output=True, encoding="utf-8", errors="replace",
+            timeout=20, env=env,
+        )
+        assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+        # Must report a tool count + tier so support can confirm at a glance.
+        assert "OK" in r.stdout
+        assert "tools registered" in r.stdout.lower()
+
+    def test_selftest_exits_2_when_kill_switch_active(self, tmp_path):
+        import subprocess, sys
+        env = {**os.environ, "MTG_ENGINE_MCP": "disabled",
+               "PYTHONIOENCODING": "utf-8",
+               "HOME": str(tmp_path), "USERPROFILE": str(tmp_path)}
+        r = subprocess.run(
+            [sys.executable, "-m", "densa_deck.cli", "mcp", "selftest"],
+            capture_output=True, encoding="utf-8", errors="replace",
+            timeout=10, env=env,
+        )
+        assert r.returncode == 2
+        assert "disabled" in (r.stdout + r.stderr).lower()
+
+
+class TestAppApiMcpMethods:
+    """The new AppApi methods that back the Settings panel's MCP card.
+    Critical: selftest_mcp must return `success` (not `ok`) so a
+    failure result reaches the frontend instead of being swallowed by
+    the @_safe error path."""
+
+    def test_get_mcp_status_returns_required_fields(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MTG_ENGINE_TIER", "pro")
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        from densa_deck.app.api import AppApi
+        api = AppApi(db_path=tmp_path / "cards.db", version_db_path=tmp_path / "v.db")
+        try:
+            r = api.get_mcp_status()
+            assert r["ok"] is True
+            data = r["data"]
+            for key in ("enabled", "reason", "sdk_present", "exe_path",
+                        "tier", "claude_config_paths"):
+                assert key in data, f"missing field: {key}"
+            paths = data["claude_config_paths"]
+            assert "windows" in paths and "macos" in paths
+        finally:
+            api.close()
+
+    def test_get_mcp_config_block_returns_valid_json(self, tmp_path, monkeypatch):
+        import json
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        from densa_deck.app.api import AppApi
+        api = AppApi(db_path=tmp_path / "cards.db", version_db_path=tmp_path / "v.db")
+        try:
+            r = api.get_mcp_config_block()
+            assert r["ok"] is True
+            data = r["data"]
+            block = json.loads(data["config_text"])
+            assert "mcpServers" in block
+            entry = block["mcpServers"]["densa-deck"]
+            assert entry["args"][:2] == ["mcp", "serve"]
+
+            # With flags
+            r2 = api.get_mcp_config_block(read_only=True, tools="search_cards")
+            block2 = json.loads(r2["data"]["config_text"])
+            args = block2["mcpServers"]["densa-deck"]["args"]
+            assert "--read-only" in args
+            assert "search_cards" in args
+        finally:
+            api.close()
+
+    def test_selftest_mcp_uses_success_field_not_ok(self, tmp_path, monkeypatch):
+        """Critical: must NOT use `ok` for the success field. @_safe
+        special-cases `ok` and would mask a False as a generic API error
+        instead of letting the UI render a clear ✗."""
+        monkeypatch.setenv("MTG_ENGINE_TIER", "pro")
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        pytest.importorskip("mcp.server.fastmcp")
+        from densa_deck.app.api import AppApi
+        api = AppApi(db_path=tmp_path / "cards.db", version_db_path=tmp_path / "v.db")
+        try:
+            r = api.selftest_mcp()
+            # @_safe wraps it because the inner dict has no "ok" key.
+            assert r["ok"] is True  # @_safe envelope succeeded
+            data = r["data"]
+            assert "success" in data, "MUST use 'success' not 'ok' (see docstring)"
+            assert data["success"] is True
+            assert data["tool_count"] > 0
+            assert data["tier"] == "pro"
+        finally:
+            api.close()
+
+    def test_selftest_mcp_failure_path_when_disabled(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MTG_ENGINE_MCP", "disabled")
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        from densa_deck.app.api import AppApi
+        api = AppApi(db_path=tmp_path / "cards.db", version_db_path=tmp_path / "v.db")
+        try:
+            r = api.selftest_mcp()
+            # Even in the failure case, the API call itself succeeded —
+            # @_safe envelope is ok=True, but inner success is False
+            # so the UI renders a ✗.
+            assert r["ok"] is True
+            data = r["data"]
+            assert data["success"] is False
+            assert data["failure_kind"] == "disabled"
+            assert "MTG_ENGINE_MCP" in data["failure_msg"]
+        finally:
+            api.close()
+
+
 class TestToolPackWhitelist:
     """`--tools name1,name2` filters the registered tool surface."""
 

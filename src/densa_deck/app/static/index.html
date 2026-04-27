@@ -491,6 +491,34 @@ Mainboard:
             <div id="analyst-pull-progress-msg" class="progress-msg"></div>
           </div>
         </div>
+
+        <div class="settings-row">
+          <h3>AI client integration (MCP)</h3>
+          <p class="panel-hint">Drive Densa Deck from Claude desktop, ulcagent, Cursor, or any AI client that speaks MCP. Free-tier tools (analyze, search, combos, brackets) always work; Pro tools (goldfish, gauntlet, analyst, coach) unlock with your license. The server runs as a local stdio subprocess — no network, no servers.</p>
+          <div id="mcp-status" class="settings-row" style="margin: 0;">(loading...)</div>
+          <div class="setup-action-row">
+            <button id="mcp-show-config-btn" class="btn btn-primary">Show Claude desktop config</button>
+            <button id="mcp-verify-btn" class="btn btn-outline">Verify connection</button>
+            <span id="mcp-status-text" class="status-text"></span>
+          </div>
+          <div id="mcp-config-block" class="hidden" style="margin-top: 10px;">
+            <p class="panel-hint" style="margin: 0 0 6px 0;">
+              Paste the block below into your Claude desktop config file
+              (location shown under it), then fully quit + relaunch Claude desktop.
+            </p>
+            <textarea id="mcp-config-text" readonly rows="9"
+              style="width: 100%; font-family: 'Consolas', monospace; font-size: 0.82rem; background: var(--color-bg); color: var(--color-text); border: 1px solid var(--color-border); padding: 8px; border-radius: 4px;"></textarea>
+            <div class="setup-action-row" style="margin-top: 6px;">
+              <button id="mcp-copy-config-btn" class="btn btn-outline btn-slim">Copy to clipboard</button>
+              <span id="mcp-copy-status" class="status-text"></span>
+            </div>
+            <p class="panel-hint" style="margin-top: 8px;">
+              <strong>Config file:</strong><br>
+              Windows:&nbsp;&nbsp;<code>%APPDATA%\Claude\claude_desktop_config.json</code><br>
+              macOS:&nbsp;&nbsp;&nbsp;&nbsp;<code>~/Library/Application Support/Claude/claude_desktop_config.json</code>
+            </p>
+          </div>
+        </div>
       </div>
     </section>
   </main>

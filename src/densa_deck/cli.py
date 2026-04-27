@@ -264,6 +264,32 @@ def main():
              "around ~10 tools). Default: all tools per --read-only mode.",
     )
 
+    # `config` — emit a ready-to-paste Claude desktop config block with the
+    # current install's exe path auto-resolved. The killer customer-flow
+    # command: one invocation, copy output, paste into Claude desktop, done.
+    mcp_config = mcp_subs.add_parser(
+        "config",
+        help="Print a Claude-desktop-ready MCP config block with the resolved exe path",
+    )
+    mcp_config.add_argument(
+        "--read-only", action="store_true",
+        help="Include --read-only in the args field of the emitted config",
+    )
+    mcp_config.add_argument(
+        "--tools", type=str, default="",
+        metavar="NAMES",
+        help="Include --tools NAMES in the args field of the emitted config",
+    )
+
+    # `selftest` — verify the server side works without involving Claude
+    # desktop. Builds the server in-process, prints the tool surface,
+    # exits 0 on success / 1 on failure. Support's first ask when the
+    # customer says "Claude doesn't see the tools."
+    mcp_subs.add_parser(
+        "selftest",
+        help="Verify the MCP server starts cleanly and lists tools (no Claude needed)",
+    )
+
     # analyst command (Pro) — manage the local GGUF model for the LLM analyst layer
     analyst_parser = subparsers.add_parser(
         "analyst", help="Manage the local LLM analyst model (Pro)")
@@ -1428,30 +1454,47 @@ def _handle_activation_url(url: str):
 
 
 def cmd_mcp(args):
-    """Run the Densa Deck MCP server on stdio.
+    """Dispatch the densa-deck mcp <subcommand>.
 
-    `densa-deck mcp serve` is the entry point — AI clients (Claude desktop,
-    ulcagent, Cursor) launch this as a subprocess and talk JSON-RPC over
-    the pipes. Free-tier tools (analyze, search, combos, version history)
-    are always exposed; Pro tools (goldfish, gauntlet, analyst, coach) are
-    license-gated via tiers.get_user_tier() — same gate the desktop UI
-    uses, so a Pro license unlocks all three surfaces from one activation.
+    Three subcommands:
 
-    `--read-only` skips registering Pro tools entirely (defense-in-depth
-    for users who want to expose the server to a less-trusted agent).
+      serve     Run the JSON-RPC server on stdio. AI clients (Claude
+                desktop, ulcagent, Cursor) launch this as a subprocess.
+      config    Print a Claude-desktop-ready config block with the
+                current install's exe path resolved. The setup
+                shortcut — paste the output into
+                claude_desktop_config.json and restart.
+      selftest  Build the server in-process and list tools, exit 0.
+                Verifies the server side works without involving
+                Claude desktop. Support's first ask when "Claude
+                doesn't see the tools."
+
+    Pro tools (goldfish, gauntlet, analyst, coach) are license-gated
+    via tiers.get_user_tier() in every path — same gate the desktop UI
+    uses, so a Pro license unlocks all three surfaces from one
+    activation.
     """
     action = getattr(args, "mcp_action", None)
-    if action != "serve":
+    if action is None:
         console.print(
-            "[yellow]Usage: densa-deck mcp serve [--read-only] [--tools NAMES][/yellow]\n"
-            "[dim]Add this server to your AI client's MCP config to drive "
-            "the engine via tool calls.[/dim]"
+            "[yellow]Usage: densa-deck mcp <serve|config|selftest>[/yellow]\n"
+            "  [bold]config[/bold]    Print a Claude-desktop-ready config block (start here)\n"
+            "  [bold]selftest[/bold]  Verify the server starts and lists tools\n"
+            "  [bold]serve[/bold]     Run the server on stdio (what AI clients call)"
         )
         return
 
-    # Operator kill switch: MTG_ENGINE_MCP=disabled or
-    # ~/.densa-deck/config.json {"mcp_enabled": false}. Checked BEFORE
-    # any MCP code imports so a paranoid install never loads the SDK.
+    if action == "config":
+        _cmd_mcp_config(args)
+        return
+    if action == "selftest":
+        _cmd_mcp_selftest()
+        return
+    if action != "serve":
+        console.print(f"[yellow]Unknown mcp subcommand: {action!r}[/yellow]")
+        return
+
+    # serve path: operator kill switch checked before any MCP code imports.
     from densa_deck.mcp.license_gate import mcp_enabled
     enabled, reason = mcp_enabled()
     if not enabled:
@@ -1463,13 +1506,9 @@ def cmd_mcp(args):
         )
         sys.exit(2)
 
-    # Parse --tools whitelist (comma-separated). Empty/None = expose
-    # the full tier-appropriate surface.
     tools_raw = getattr(args, "tools", "") or ""
     tool_pack = [t.strip() for t in tools_raw.split(",") if t.strip()]
 
-    # Lazy import — keeps the rest of the CLI importable even when the
-    # optional `mcp` SDK isn't installed.
     from densa_deck.mcp.server import McpSdkMissingError, run_stdio_server
     try:
         run_stdio_server(
@@ -1477,15 +1516,189 @@ def cmd_mcp(args):
             tool_pack=tool_pack or None,
         )
     except McpSdkMissingError as e:
-        # SDK missing is a setup gap, not a runtime crash — show the
-        # install hint cleanly and exit nonzero so scripts can detect it.
         console.print(f"[yellow]{e}[/yellow]")
         sys.exit(1)
     except ValueError as e:
-        # build_server raises ValueError for unknown --tools names so
-        # the user sees a typo before the server starts.
         console.print(f"[red]{e}[/red]")
         sys.exit(1)
+
+
+def _resolve_command_for_config() -> tuple[str, list[str]]:
+    """Figure out the right `command` + leading args for the emitted config.
+
+    Two install shapes:
+
+      1. PyInstaller-frozen bundle (`densa-deck.exe`) — `sys.executable`
+         IS the entry point. Customers who installed via the Inno
+         installer or extracted the portable ZIP are here. Returns the
+         absolute path to that exe.
+      2. `pip install densa-deck` — `sys.executable` is `python.exe`,
+         and the entry point is the script that pyproject.toml ships
+         under `[project.scripts]`. The bare `densa-deck` command is
+         on PATH because pip put it there. Returns just `densa-deck`.
+
+    Detection: `sys.frozen` is True under PyInstaller's frozen build.
+    """
+    if getattr(sys, "frozen", False):
+        return sys.executable, []
+    # pip install path — bare command, presumed on PATH.
+    return "densa-deck", []
+
+
+def _cmd_mcp_config(args):
+    """Emit a paste-ready claude_desktop_config.json block for THIS install.
+
+    Customer flow: `densa-deck mcp config` → copy output → open
+    `%APPDATA%\\Claude\\claude_desktop_config.json` (Windows) or
+    `~/Library/Application Support/Claude/claude_desktop_config.json`
+    (macOS) → paste → restart Claude desktop. Done.
+
+    Solves the PATH gap: PyInstaller-frozen installs don't add
+    densa-deck to PATH, so a generic config block with `"command":
+    "densa-deck"` fails on customer machines. This emits the
+    fully-resolved exe path automatically.
+    """
+    import json
+
+    command, base_args = _resolve_command_for_config()
+    serve_args = list(base_args) + ["mcp", "serve"]
+    if getattr(args, "read_only", False):
+        serve_args.append("--read-only")
+    tools_raw = getattr(args, "tools", "") or ""
+    tool_pack = [t.strip() for t in tools_raw.split(",") if t.strip()]
+    if tool_pack:
+        serve_args += ["--tools", ",".join(tool_pack)]
+
+    config = {
+        "mcpServers": {
+            "densa-deck": {
+                "command": command,
+                "args": serve_args,
+            }
+        }
+    }
+    config_str = json.dumps(config, indent=2)
+
+    # Where to paste. The platform check is for the user's *Claude
+    # desktop install*, not their Densa Deck install — they could be
+    # running Densa Deck on a Windows test laptop and Claude desktop
+    # on a separate Mac. List both.
+    console.print()
+    console.print("[bold cyan]Densa Deck — Claude desktop MCP config[/bold cyan]")
+    console.print()
+    console.print(
+        "[dim]Paste this block into your Claude desktop config file, "
+        "then fully quit + relaunch Claude desktop:[/dim]"
+    )
+    console.print()
+    # Print the JSON without Rich markup interference.
+    print(config_str)
+    console.print()
+    console.print("[bold]Config file location:[/bold]")
+    console.print(r"  Windows:  %APPDATA%\Claude\claude_desktop_config.json")
+    console.print("  macOS:    ~/Library/Application Support/Claude/claude_desktop_config.json")
+    console.print()
+    console.print(
+        "[dim]After pasting, run [bold]densa-deck mcp selftest[/bold] to verify "
+        "the server side before debugging Claude desktop.[/dim]"
+    )
+
+
+def _cmd_mcp_selftest():
+    """Build the server in-process, list its tools, exit 0/1.
+
+    Customer-friendly verification: prints "OK ({N} tools)" on success,
+    or a clear failure cause. This is the first thing support asks the
+    customer to run when "Claude doesn't see the tools" — if selftest
+    is OK, the problem is on the Claude desktop side; if selftest
+    fails, the problem is the install/license/SDK.
+    """
+    from densa_deck.mcp.license_gate import current_tier, mcp_enabled
+
+    enabled, reason = mcp_enabled()
+    if not enabled:
+        console.print(f"[yellow]MCP is disabled by operator setting ({reason}).[/yellow]")
+        sys.exit(2)
+
+    try:
+        from densa_deck.mcp.server import (
+            McpSdkMissingError,
+            build_server,
+        )
+    except McpSdkMissingError as e:
+        console.print(f"[red]MCP SDK missing:[/red] {e}")
+        sys.exit(1)
+
+    try:
+        server = build_server(read_only=False)
+    except McpSdkMissingError as e:
+        console.print(f"[red]MCP SDK missing:[/red] {e}")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Failed to build server:[/red] {e}")
+        sys.exit(1)
+
+    # FastMCP's tool list is async. Use a fresh event loop and close it
+    # — asyncio.run() closes the global default loop on exit, which
+    # breaks downstream sync code that does `asyncio.get_event_loop()`
+    # (see test_new_features.py::TestURLImport::test_moxfield... on
+    # Python 3.10).
+    import asyncio
+    loop = asyncio.new_event_loop()
+    try:
+        tools = loop.run_until_complete(server.list_tools())
+    except Exception as e:
+        loop.close()
+        console.print(f"[red]Failed to list tools:[/red] {e}")
+        sys.exit(1)
+
+    tier = current_tier()
+    console.print(
+        f"[green]OK[/green] — {len(tools)} tools registered "
+        f"({tier.value} tier)."
+    )
+    # First-line verification for the user: is Pro showing up?
+    pro_visible = any(
+        t.name in {"run_goldfish", "run_gauntlet", "compare_decks_analyst"}
+        for t in tools
+    )
+    if tier.value == "pro" and not pro_visible:
+        console.print(
+            "[yellow]Warning:[/yellow] Pro tier detected but no Pro tools are "
+            "registered. License may not be activating — check Settings → "
+            "License in the desktop app."
+        )
+        sys.exit(1)
+    if tier.value == "free" and pro_visible:
+        # Defense-in-depth: pro tools should be visible (the assert_pro
+        # gate fires per-call), but flag if read-only mode somehow leaked.
+        pass
+    # Spot-check that a tool is invokable end-to-end. get_current_version
+    # has no required args and no DB dependency. Reuse the same loop —
+    # don't open a second one.
+    try:
+        result = loop.run_until_complete(
+            server.call_tool("get_current_version", arguments={})
+        )
+        if hasattr(result, "isError") and result.isError:
+            loop.close()
+            console.print(
+                f"[yellow]get_current_version returned an error result[/yellow]"
+            )
+            sys.exit(1)
+    except Exception as e:
+        loop.close()
+        console.print(f"[yellow]Tool dispatch failed:[/yellow] {e}")
+        sys.exit(1)
+    finally:
+        if not loop.is_closed():
+            loop.close()
+
+    console.print(
+        f"[dim]All checks passed. To wire Claude desktop, run "
+        f"[bold]densa-deck mcp config[/bold] and paste the output into your "
+        f"Claude desktop config file.[/dim]"
+    )
 
 
 def cmd_register_protocol(args):

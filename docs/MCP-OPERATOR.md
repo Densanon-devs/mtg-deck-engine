@@ -12,27 +12,40 @@ the desktop app don't need to read this.
 
 ---
 
-## TL;DR
+## TL;DR — fastest path from install to working
 
-- **Default:** install Densa Deck, run `densa-deck mcp serve` from your AI
-  client's MCP config. 17 free tools always; 11 Pro tools if you have a
-  license. License gating is automatic.
-- **Turn it off entirely:** `MTG_ENGINE_MCP=disabled` env, or
-  `{"mcp_enabled": false}` in `~/.densa-deck/config.json`.
+```bash
+# 1. Verify the server side works (no Claude desktop involved):
+densa-deck mcp selftest
+# Expected: "OK — 28 tools registered (pro tier)."
+
+# 2. Get a paste-ready Claude desktop config block with YOUR install's
+#    exe path already filled in:
+densa-deck mcp config
+# Expected: prints a {"mcpServers": {"densa-deck": {"command": "...", "args": [...]}}} block
+
+# 3. Open Claude desktop's config file (path printed by mcp config),
+#    paste the block, save, fully quit + relaunch Claude desktop.
+```
+
+The desktop UI also has a built-in **Settings → AI client integration (MCP)**
+panel with "Show Claude desktop config" / "Verify connection" / "Copy to
+clipboard" buttons. Same flow, but click-driven for non-CLI users.
+
 - **Curate the exposed surface:** `densa-deck mcp serve --tools name1,name2`.
 - **Hide every Pro tool from the AI client:** `--read-only`.
+- **Turn it off entirely:** `MTG_ENGINE_MCP=disabled` env, or
+  `{"mcp_enabled": false}` in `~/.densa-deck/config.json`.
 
-```jsonc
-// claude_desktop_config.json — minimal default config
-{
-  "mcpServers": {
-    "densa-deck": {
-      "command": "densa-deck",
-      "args": ["mcp", "serve"]
-    }
-  }
-}
-```
+### Why `mcp config` instead of writing the JSON yourself
+
+The bundled installer drops `densa-deck.exe` at
+`%LOCALAPPDATA%\Programs\Densa Deck\densa-deck.exe` and does **not** add
+it to PATH. A generic config with `"command": "densa-deck"` will fail
+on installer customers — Claude desktop reports "command not found." The
+`mcp config` subcommand resolves the right path for your install
+(absolute path for frozen binaries, bare `densa-deck` for `pip install`)
+so the customer never has to think about it.
 
 ---
 
@@ -138,12 +151,23 @@ MTG_ENGINE_TIER=pro densa-deck mcp serve   # forces Pro for testing
 MTG_ENGINE_TIER=free densa-deck mcp serve  # simulates free user
 ```
 
+### Subcommands
+
+`densa-deck mcp` has three subcommands. Customers should generally start
+with `selftest`, then `config`. `serve` is what AI clients call.
+
+| Subcommand | Use case | Exits |
+|---|---|---|
+| `mcp selftest` | "Does the server side work?" Builds the server in-process, lists tools, exits cleanly. Run this BEFORE filing a bug or debugging Claude desktop. | 0 ok / 1 SDK or build issue / 2 disabled |
+| `mcp config` | "Give me the right Claude desktop config block." Emits a paste-ready JSON config with the install's exe path resolved. Supports `--read-only` and `--tools NAMES` to bake those into the emitted args. | 0 |
+| `mcp serve` | What an AI client launches as a subprocess. Speaks JSON-RPC on stdio. Supports `--read-only` and `--tools NAMES`. | 0 ok / 1 SDK missing or bad `--tools` / 2 disabled |
+
 ### Exit codes
 
 | Code | Meaning |
 |---|---|
-| `0` | Server ran cleanly until the AI client closed the subprocess |
-| `1` | `mcp` SDK not installed, OR an unknown name in `--tools` |
+| `0` | Server ran cleanly until the AI client closed the subprocess (or `mcp config` finished printing) |
+| `1` | `mcp` SDK not installed, OR an unknown name in `--tools`, OR selftest failed |
 | `2` | Operator kill switch active (env var or config) |
 
 Any other non-zero exit indicates a real crash — capture stderr and
@@ -339,6 +363,21 @@ the server itself.
 
 ## Troubleshooting
 
+### Step 0: run selftest first
+
+Almost every "Claude desktop doesn't see Densa Deck tools" report is
+fixable with one command:
+
+```bash
+densa-deck mcp selftest
+```
+
+- **If selftest is OK** → the server side is fine; the problem is in
+  the Claude desktop config (wrong path, wrong file, or Claude desktop
+  not fully restarted). Re-run `densa-deck mcp config` and re-paste.
+- **If selftest fails** → the failure_kind tells you which side to fix
+  (sdk_missing, disabled, build_failed, list_failed).
+
 ### "MCP server is disabled by operator setting"
 
 The kill switch is active. The reason string in the message names which
@@ -367,6 +406,15 @@ be inside — file a bug if it isn't.
 
 Typo in `--tools`. The error message lists every available name; copy
 from there.
+
+### Claude desktop says "command not found: densa-deck"
+
+The Inno installer doesn't add Densa Deck to PATH (per-user install,
+no admin elevation). Use `densa-deck mcp config` from a terminal to
+get a config block with the absolute path resolved, OR open Settings
+→ AI client integration → "Show Claude desktop config" in the desktop
+UI and copy from there. Replace the existing config block with the
+one produced by either method.
 
 ### AI client says "tool not found" mid-conversation
 

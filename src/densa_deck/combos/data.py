@@ -46,7 +46,7 @@ from densa_deck.combos.models import Combo
 DEFAULT_COMBO_DB_PATH = Path.home() / ".densa-deck" / "combos.db"
 SPELLBOOK_API_BASE = "https://backend.commanderspellbook.com"
 PAGE_SIZE = 500
-USER_AGENT_DEFAULT = "DensaDeck/0.4.0 (combo-fetch)"
+USER_AGENT_DEFAULT = "DensaDeck/0.4.1 (combo-fetch)"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS combos (

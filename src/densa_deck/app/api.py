@@ -20,6 +20,7 @@ can come back, tweak, re-save as a new version.
 from __future__ import annotations
 
 import json
+import sys
 import threading
 import traceback
 import uuid
@@ -1208,6 +1209,166 @@ class AppApi:
             return {"ok": False, "error": f"Failed to clear draft: {e}"}
         return {"cleared": True}
 
+    # ------------------------------------------------------------------ MCP (AI client integration)
+
+    @_safe
+    def get_mcp_status(self) -> dict:
+        """Return the MCP integration status for the Settings panel.
+
+        Includes:
+          - enabled / disabled (operator kill switch)
+          - reason (which control flipped, if disabled)
+          - sdk_present (the `mcp` Python package importable)
+          - exe_path (the resolved path the customer should use in
+            their Claude desktop config — frozen install absolute path,
+            or "densa-deck" for pip installs)
+          - tier — tells the UI whether to advertise Pro tools
+          - claude_config_paths — both Windows + macOS locations the
+            Settings panel can show as one-click open targets
+        """
+        from densa_deck.mcp.license_gate import current_tier, mcp_enabled
+        enabled, reason = mcp_enabled()
+        sdk_present = True
+        try:
+            import importlib
+            importlib.import_module("mcp.server.fastmcp")
+        except ImportError:
+            sdk_present = False
+
+        # Mirror cli._resolve_command_for_config — but inline here so the
+        # API doesn't import the whole CLI module.
+        if getattr(sys, "frozen", False):
+            exe_path = sys.executable
+        else:
+            exe_path = "densa-deck"
+
+        claude_config_paths = {
+            "windows": r"%APPDATA%\Claude\claude_desktop_config.json",
+            "macos": "~/Library/Application Support/Claude/claude_desktop_config.json",
+        }
+
+        return {
+            "enabled": enabled,
+            "reason": reason,
+            "sdk_present": sdk_present,
+            "exe_path": exe_path,
+            "tier": current_tier().value,
+            "claude_config_paths": claude_config_paths,
+        }
+
+    @_safe
+    def get_mcp_config_block(
+        self,
+        read_only: bool = False,
+        tools: str = "",
+    ) -> dict:
+        """Return a paste-ready Claude desktop config block as a string.
+
+        The Settings panel's "Copy MCP config" button calls this and
+        drops the result into the user's clipboard. Same output as
+        `densa-deck mcp config` from the CLI, threaded through the
+        same `_resolve_command_for_config` shape so the bundled exe
+        and the pip install both produce correct configs.
+        """
+        import json as _json
+        if getattr(sys, "frozen", False):
+            command = sys.executable
+        else:
+            command = "densa-deck"
+        serve_args: list[str] = ["mcp", "serve"]
+        if read_only:
+            serve_args.append("--read-only")
+        tools = (tools or "").strip()
+        tool_pack = [t.strip() for t in tools.split(",") if t.strip()]
+        if tool_pack:
+            serve_args += ["--tools", ",".join(tool_pack)]
+
+        block = {
+            "mcpServers": {
+                "densa-deck": {
+                    "command": command,
+                    "args": serve_args,
+                }
+            }
+        }
+        return {
+            "config_text": _json.dumps(block, indent=2),
+            "read_only": read_only,
+            "tool_count": len(tool_pack),
+        }
+
+    @_safe
+    def selftest_mcp(self) -> dict:
+        """Build the MCP server in-process, list its tools. UI's "Verify
+        connection" button calls this — gives the customer a green check
+        before they even open Claude desktop.
+
+        Returns a flat dict (not an `{"ok": ..., "data": ...}` envelope —
+        @_safe wraps it for us) describing the test outcome:
+
+          - success: True if the server built and tools listed cleanly.
+          - tool_count + tool_names: present on success.
+          - tier: always present.
+          - failure_kind / failure_msg: present on success=False
+            ("disabled" / "sdk_missing" / "build_failed" / "list_failed").
+
+        Using `success` instead of `ok` because @_safe special-cases the
+        "ok" key — a False would mask the success/failure as an
+        unconditional API error. We want the panel to render a clear
+        ✓ or ✗ either way, not throw.
+        """
+        from densa_deck.mcp.license_gate import current_tier, mcp_enabled
+        tier = current_tier().value
+        enabled, reason = mcp_enabled()
+        if not enabled:
+            return {
+                "success": False,
+                "tier": tier,
+                "failure_kind": "disabled",
+                "failure_msg": f"MCP is disabled by operator setting ({reason}).",
+            }
+
+        try:
+            from densa_deck.mcp.server import build_server
+        except ImportError as e:
+            return {
+                "success": False, "tier": tier,
+                "failure_kind": "sdk_missing", "failure_msg": str(e),
+            }
+
+        try:
+            server = build_server(read_only=False)
+        except Exception as e:
+            err_kind = "sdk_missing" if "mcp" in str(e).lower() else "build_failed"
+            return {
+                "success": False, "tier": tier,
+                "failure_kind": err_kind, "failure_msg": str(e),
+            }
+
+        # Use a fresh event loop and close it explicitly. asyncio.run()
+        # closes the *default* event loop on exit, which breaks any
+        # later sync test that does `asyncio.get_event_loop()` (see
+        # test_new_features.py's Moxfield 403 path on Python 3.10).
+        import asyncio
+        loop = asyncio.new_event_loop()
+        try:
+            tools = loop.run_until_complete(server.list_tools())
+        except Exception as e:
+            return {
+                "success": False, "tier": tier,
+                "failure_kind": "list_failed", "failure_msg": str(e),
+            }
+        finally:
+            loop.close()
+
+        names = sorted(t.name for t in tools)
+        return {
+            "success": True,
+            "tool_count": len(names),
+            "tool_names": names,
+            "tier": tier,
+        }
+
     # ------------------------------------------------------------------ combos (Commander Spellbook)
 
     @_safe
@@ -1677,7 +1838,7 @@ class AppApi:
 
             written = refresh_combo_snapshot(
                 store=store,
-                user_agent=f"DensaDeck/0.4.0 (combo-fetch)",
+                user_agent=f"DensaDeck/0.4.1 (combo-fetch)",
                 progress_cb=_on_page,
             )
             self._update_progress(
